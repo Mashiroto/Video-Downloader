@@ -1,6 +1,6 @@
 """
 Video Downloader
-Version: 1.2.0
+Version: 1.3.0
 Author: Mashiroto (with Claude)
 
 Description:
@@ -20,6 +20,8 @@ Tip: sites change often. If a download suddenly stops working, update with:
     py -m pip install -U yt-dlp
 
 Changelog:
+- 1.3.0: Playlists: detected automatically, list with check boxes + editable titles,
+         downloads one after another (Cancel button, skips files that already exist).
 - 1.2.0: 'Copy to clipboard' target: temporary download you can paste with Ctrl+V.
 - 1.1.0: Blue theme, rounded modern look, open-folder icon in history,
          quality + file size in the preview, zoom (Ctrl + mouse wheel).
@@ -236,6 +238,22 @@ def source_quality(meta):
     return q, (f"{int(abr)} kbps" if abr else "—")
 
 
+def safe_dir(name):
+    name = re.sub(r'[\\/:*?"<>|]+', "", name).strip().strip(".")
+    return name[:80].strip() or "Playlist"
+
+
+def format_opts(fmt, quality):
+    """yt-dlp settings for MP3 / MP4 with the chosen quality."""
+    if fmt == "mp3":
+        return {"format": "bestaudio/best",
+                "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3",
+                                    "preferredquality": quality}]}
+    res = "res" if quality == "best" else f"res:{quality}"
+    return {"format": "bv*+ba/b", "format_sort": [res, "ext:mp4:m4a"], "merge_output_format": "mp4",
+            "postprocessors": [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}]}
+
+
 def open_path(path):
     try:
         if sys.platform.startswith("win"):
@@ -251,7 +269,9 @@ def open_path(path):
 def reveal(path, fallback_folder):
     """Open the folder of a saved file (and highlight the file on Windows/Mac)."""
     try:
-        if path and os.path.exists(path):
+        if path and os.path.isdir(path):   # a folder (playlist): just open it
+            open_path(path)
+        elif path and os.path.exists(path):
             if sys.platform.startswith("win"):
                 subprocess.Popen(f'explorer /select,"{os.path.normpath(path)}"')
             elif sys.platform == "darwin":
@@ -357,6 +377,32 @@ def rounded_photo(pil, w, h, r, bg):
     return ImageTk.PhotoImage(base.resize((w, h), RESAMPLE))
 
 
+def checkbox_image(size, on, bgc):
+    key = ("chk", size, on, bgc)
+    img = _cache.get(key)
+    if img is not None:
+        return img
+    ss = 4
+    S = size * ss
+    im = Image.new("RGB", (S, S), bgc)
+    d = ImageDraw.Draw(im)
+    r = int(S * 0.28)
+    if on:
+        d.rounded_rectangle([0, 0, S - 1, S - 1], radius=r, fill=ACCENT)
+        lw = max(2, int(S * 0.12))
+        pts = [(S * .24, S * .52), (S * .43, S * .70), (S * .76, S * .30)]
+        d.line(pts, fill=ON_ACCENT, width=lw, joint="curve")
+        for x, y in (pts[0], pts[-1]):
+            d.ellipse([x - lw / 2, y - lw / 2, x + lw / 2, y + lw / 2], fill=ON_ACCENT)
+    else:
+        d.rounded_rectangle([0, 0, S - 1, S - 1], radius=r, fill="#3a3d45")
+        b = max(2, int(S * 0.08))
+        d.rounded_rectangle([b, b, S - 1 - b, S - 1 - b], radius=max(0, r - b), fill=PANEL3)
+    img = ImageTk.PhotoImage(im.resize((size, size), RESAMPLE))
+    _cache[key] = img
+    return img
+
+
 # ---------- Custom widgets ----------
 class RoundFrame(tk.Canvas):
     """A rounded 'card'. Put your widgets into .body"""
@@ -397,6 +443,7 @@ class Btn(tk.Canvas):
         self.f = font or F(10, "bold")
         self.text, self.command, self.primary, self.icon = text, command, primary, icon
         self.icon_kind = icon_kind
+        self._padx = padx
         self.r = sc(radius)
         self.active = self.disabled = self.hover = False
         if size:
@@ -416,7 +463,7 @@ class Btn(tk.Canvas):
 
     def _colors(self):
         if self.disabled:
-            return PANEL3, MUTED
+            return (ACCENT_SOFT, MUTED) if self.active else (PANEL3, MUTED)
         if self.icon:
             return (ACCENT_SOFT, ACCENT_HOVER) if self.hover else (PANEL3, ACCENT)
         if self.primary or self.active:
@@ -449,6 +496,8 @@ class Btn(tk.Canvas):
 
     def set_text(self, text):
         self.text = text
+        if not self.icon:
+            self.configure(width=self.f.measure(text) + 2 * sc(self._padx))
         self._paint()
 
     def set_active(self, on):
@@ -489,6 +538,10 @@ class Chips(tk.Frame):
         if notify and changed and self.command:
             self.command(val)
 
+    def set_disabled(self, on):
+        for b in self.btns:
+            b.set_disabled(on)
+
 
 class Switch(tk.Canvas):
     """On/off switch."""
@@ -498,6 +551,7 @@ class Switch(tk.Canvas):
                          highlightthickness=0, bd=0, cursor="hand2")
         self._pbg = parent.cget("bg")
         self.on = on
+        self.disabled = False
         self.command = command
         self._refs = []
         self.bind("<Button-1>", self.toggle)
@@ -505,20 +559,62 @@ class Switch(tk.Canvas):
 
     def draw(self):
         self.delete("all")
-        col = ACCENT if self.on else PANEL3
+        if self.disabled:
+            col = ACCENT_SOFT if self.on else PANEL3
+        else:
+            col = ACCENT if self.on else PANEL3
         pad = sc(3)
         kn = self.h - 2 * pad
         pill = rr_image(self.w, self.h, self.h // 2, col, None if self.on else "#33363d", self._pbg)
-        knob = rr_image(kn, kn, kn // 2, ON_ACCENT if self.on else MUTED, None, col)
+        knob_col = MUTED if (self.disabled or not self.on) else ON_ACCENT
+        knob = rr_image(kn, kn, kn // 2, knob_col, None, col)
         self._refs = [pill, knob]
         self.create_image(0, 0, image=pill, anchor="nw")
         self.create_image(self.w - kn - pad if self.on else pad, pad, image=knob, anchor="nw")
 
     def toggle(self, e=None):
+        if self.disabled:
+            return
         self.on = not self.on
         self.draw()
         if self.command:
             self.command(self.on)
+
+    def set_on(self, on):
+        self.on = on
+        self.draw()
+
+    def set_disabled(self, on):
+        self.disabled = on
+        self.configure(cursor="arrow" if on else "hand2")
+        self.draw()
+
+
+class Check(tk.Canvas):
+    """Small rounded check box."""
+    def __init__(self, parent, on, command):
+        self.sz = sc(22)
+        super().__init__(parent, width=self.sz, height=self.sz, bg=parent.cget("bg"),
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self._pbg = parent.cget("bg")
+        self.on, self.command, self._img = on, command, None
+        self.bind("<Button-1>", self._click)
+        self._paint()
+
+    def _paint(self):
+        self.delete("all")
+        self._img = checkbox_image(self.sz, self.on, self._pbg)
+        self.create_image(0, 0, image=self._img, anchor="nw")
+
+    def _click(self, e):
+        self.on = not self.on
+        self._paint()
+        if self.command:
+            self.command(self.on)
+
+    def set(self, on):
+        self.on = on
+        self._paint()
 
 
 class Pill(tk.Canvas):
@@ -762,6 +858,9 @@ class App:
         self.end_var = tk.StringVar(value="0:00")
         self.fmt, self.qval = "mp4", "best"
         self.dest = "disk"   # "disk" = save to folder, "clip" = temporary + copy to clipboard
+        self.is_playlist, self.pl_items, self.pl_open = False, [], False
+        self._pl_gen, self._pl_rendered = 0, False
+        self.cancel_event = threading.Event()
         self.trim_on = False
         self.t_lo = self.t_hi = 0
         self.meta = None
@@ -873,6 +972,8 @@ class App:
 
     # ----- main layout -----
     def build_ui(self):
+        self._pl_gen += 1          # stops row-building of a previous window
+        self._pl_rendered = False
         self.canvas = tk.Canvas(self.root, bg=BG, highlightthickness=0)
         self.sb = ttk.Scrollbar(self.root, orient="vertical", command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=self.sb.set)
@@ -933,11 +1034,36 @@ class App:
             tk.Label(right, text="—", bg=PANEL, fg=TEXT, font=F(10), anchor="w"),
             tk.Label(right, text="—", bg=PANEL, fg=TEXT, font=F(10), anchor="w"),
             tk.Label(right, text="—", bg=PANEL, fg=ACCENT, font=F(10, "bold"), anchor="w"))
+        self.cap_lbls = []
         for i, (cap, lb) in enumerate((("Quality", self.v_quality), ("Audio", self.v_audio),
                                        ("Est. size", self.v_size))):
-            tk.Label(right, text=cap, bg=PANEL, fg=MUTED, font=F(9), anchor="w").grid(
-                row=i, column=0, sticky="w", padx=(0, sc(12)))
+            cl = tk.Label(right, text=cap, bg=PANEL, fg=MUTED, font=F(9), anchor="w")
+            cl.grid(row=i, column=0, sticky="w", padx=(0, sc(12)))
             lb.grid(row=i, column=1, sticky="w")
+            self.cap_lbls.append(cl)
+
+        # playlist: button (only shown for playlists) + list panel (hidden until you press the button)
+        self.pl_btn = Btn(info, "Show playlist (000)", self.toggle_playlist, padx=16, pady=7)
+        self.pl_panel = tk.Frame(body, bg=PANEL)
+        ptop = tk.Frame(self.pl_panel, bg=PANEL)
+        ptop.pack(fill="x", pady=(0, sc(8)))
+        self.pl_count = tk.Label(ptop, text="", bg=PANEL, fg=MUTED, font=F(10))
+        self.pl_count.pack(side="left")
+        Btn(ptop, "Select none", lambda: self.select_all(False), padx=12, pady=5).pack(side="right")
+        Btn(ptop, "Select all", lambda: self.select_all(True), padx=12, pady=5).pack(
+            side="right", padx=(0, sc(8)))
+        lf = RoundFrame(self.pl_panel, fill=PANEL2, outline=BORDER, radius=14, padx=6, pady=6)
+        lf.pack(fill="x")
+        self.pl_canvas = tk.Canvas(lf.body, bg=PANEL2, highlightthickness=0, bd=0, height=sc(320))
+        psb = ttk.Scrollbar(lf.body, orient="vertical", command=self.pl_canvas.yview)
+        self.pl_canvas.configure(yscrollcommand=psb.set)
+        psb.pack(side="right", fill="y")
+        self.pl_canvas.pack(side="left", fill="x", expand=True)
+        self.pl_inner = tk.Frame(self.pl_canvas, bg=PANEL2)
+        self._pl_win = self.pl_canvas.create_window((0, 0), window=self.pl_inner, anchor="nw")
+        self.pl_inner.bind("<Configure>",
+                           lambda e: self.pl_canvas.configure(scrollregion=self.pl_canvas.bbox("all")))
+        self.pl_canvas.bind("<Configure>", lambda e: self.pl_canvas.itemconfigure(self._pl_win, width=e.width))
 
         # 3) Output
         body = self.card(3, "Output")
@@ -959,10 +1085,9 @@ class App:
         nr = self.row(body, "Filename")
         self.name_row = self._last_row
         RoundEntry(nr, self.name_var).pack(fill="x")
-        if self.dest == "clip":
-            self.folder_row.pack_forget()
-        tk.Label(body, text="Filename is optional. Leave it empty to use the video title.",
-                 bg=PANEL, fg=MUTED, font=F(9), anchor="w").pack(fill="x", pady=(sc(4), 0))
+        self.name_note = tk.Label(body, text="Filename is optional. Leave it empty to use the video title.",
+                                  bg=PANEL, fg=MUTED, font=F(9), anchor="w")
+        self.name_note.pack(fill="x", pady=(sc(4), 0))
 
         # 4) Trim
         body = self.card(4, "Trim (optional)")
@@ -1002,7 +1127,7 @@ class App:
         self.go_btn = Btn(body, self.go_text(), self.start_download, primary=True,
                           font=F(12, "bold"), pady=12, radius=14)
         self.go_btn.pack(fill="x")
-        self.go_btn.set_disabled(self.busy)
+        self.go_btn.set_disabled(self.busy and not self.is_playlist)
         self.progress = ProgressBar(body)
         self.progress.pack(fill="x", pady=(sc(14), 0))
         self.status = tk.Label(body, text=self.status_text, bg=PANEL, fg=self.status_color,
@@ -1030,16 +1155,33 @@ class App:
             self.progress.start()
         else:
             self.progress.set_fraction(self.prog_frac)
+        self.apply_mode()
+        self.update_playlist_ui()
 
     # ----- scrolling / layout -----
     def on_canvas_resize(self, e):
         self.canvas.itemconfigure(self.win, width=min(e.width - sc(40), sc(820)))
         self.canvas.coords(self.win, e.width // 2, 0)
 
+    @staticmethod
+    def _inside(w, container):
+        while w is not None:
+            if w == container:
+                return True
+            w = getattr(w, "master", None)
+        return False
+
     def on_wheel(self, e):
+        step = -e.delta if sys.platform == "darwin" else -(e.delta // 120)
+        try:
+            w = self.root.winfo_containing(e.x_root, e.y_root)
+        except Exception:
+            w = None
+        if self.is_playlist and self.pl_open and self._inside(w, self.pl_canvas):
+            self.pl_canvas.yview_scroll(step, "units")   # scroll the list, not the page
+            return
         if self.page.winfo_height() <= self.canvas.winfo_height():
             return
-        step = -e.delta if sys.platform == "darwin" else -(e.delta // 120)
         self.canvas.yview_scroll(step, "units")
 
     # ----- status helpers -----
@@ -1082,34 +1224,56 @@ class App:
 
     def fetch(self, url):
         try:
-            opts = {"quiet": True, "no_warnings": True, "noplaylist": True,
-                    "skip_download": True, "logger": QuietLogger(), "socket_timeout": 15}
+            opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True,
+                    "logger": QuietLogger(), "socket_timeout": 15, "extract_flat": "in_playlist"}
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
-            if info.get("_type") == "playlist":
-                raise ValueError("This is a playlist link. Please paste the link of a single video.")
-            img = None
+            playlist = info.get("_type") == "playlist"
             t = info.get("thumbnail") or ((info.get("thumbnails") or [{}])[-1]).get("url")
+            entries, skipped = [], 0
+            if playlist:
+                for e in (info.get("entries") or []):
+                    if not e:
+                        continue
+                    title = e.get("title") or ""
+                    vurl = e.get("url") or e.get("webpage_url") or ""
+                    if vurl and not vurl.startswith("http") and e.get("id"):
+                        vurl = "https://www.youtube.com/watch?v=" + e["id"]
+                    if not vurl or title in ("[Private video]", "[Deleted video]"):
+                        skipped += 1
+                        continue
+                    if not t:
+                        t = ((e.get("thumbnails") or [{}])[-1]).get("url")
+                    entries.append({"url": vurl, "title": title or "Untitled", "duration": e.get("duration")})
+                if not entries:
+                    raise ValueError("This playlist has no downloadable videos.")
+            img = None
             if t:
                 try:
                     req = urllib.request.Request(t, headers={"User-Agent": "Mozilla/5.0"})
                     img = urllib.request.urlopen(req, timeout=10).read()
                 except Exception:
                     img = None
-            formats = []
-            for f in info.get("formats") or []:
-                formats.append({
-                    "h": f.get("height"), "fps": f.get("fps"),
-                    "v": (f.get("vcodec") or "none") != "none",
-                    "a": (f.get("acodec") or "none") != "none",
-                    "size": f.get("filesize") or f.get("filesize_approx"),
-                    "tbr": f.get("tbr"), "abr": f.get("abr"),
-                })
-            meta = {"title": info.get("title") or "Untitled",
-                    "uploader": info.get("uploader") or info.get("channel") or "",
-                    "site": info.get("extractor_key") or "",
-                    "duration": info.get("duration"),
-                    "formats": formats}
+            if playlist:
+                meta = {"title": info.get("title") or "Playlist",
+                        "uploader": info.get("uploader") or info.get("channel") or "",
+                        "site": "Playlist", "duration": None, "formats": [],
+                        "is_playlist": True, "entries": entries, "skipped": skipped}
+            else:
+                formats = []
+                for f in info.get("formats") or []:
+                    formats.append({
+                        "h": f.get("height"), "fps": f.get("fps"),
+                        "v": (f.get("vcodec") or "none") != "none",
+                        "a": (f.get("acodec") or "none") != "none",
+                        "size": f.get("filesize") or f.get("filesize_approx"),
+                        "tbr": f.get("tbr"), "abr": f.get("abr"),
+                    })
+                meta = {"title": info.get("title") or "Untitled",
+                        "uploader": info.get("uploader") or info.get("channel") or "",
+                        "site": info.get("extractor_key") or "",
+                        "duration": info.get("duration"),
+                        "formats": formats}
             self.q.put(("info", url, meta, img))
         except Exception as e:
             self.q.put(("info_error", url, clean_error(e)))
@@ -1119,6 +1283,11 @@ class App:
             return
         self.loaded_url = url
         self.meta = meta
+        self.is_playlist = bool(meta.get("is_playlist"))
+        self.pl_items = [dict(e, include=True, var=tk.StringVar(value=e["title"]))
+                         for e in meta.get("entries", [])] if self.is_playlist else []
+        self.pl_open = False
+        self._pl_rendered = False
         self.thumb_pil = None
         if img:
             try:
@@ -1132,13 +1301,20 @@ class App:
         self.sync_trim_text(0, dur or 0)
         self.trim_note.config(text=self.trim_note_text())
         self.show_meta()
-        self.set_link_msg("✓ Video found", OK)
+        self.apply_mode()
+        self.update_playlist_ui()
+        if self.is_playlist:
+            extra = f" ({meta['skipped']} unavailable skipped)" if meta.get("skipped") else ""
+            self.set_link_msg(f"✓ Playlist found · {len(self.pl_items)} videos{extra}", OK)
+        else:
+            self.set_link_msg("✓ Video found", OK)
 
     def on_info_error(self, url, msg):
         if url != self.loading_url:
             return
         self.loaded_url = None
         self.meta = None
+        self.is_playlist, self.pl_items, self.pl_open = False, [], False
         self.duration = None
         self.thumb_pil = None
         self.slider.enabled = False
@@ -1146,10 +1322,16 @@ class App:
         self.t_lo = self.t_hi = 0
         self.trim_note.config(text=self.trim_note_text())
         self.show_meta()
+        self.apply_mode()
+        self.update_playlist_ui()
         self.set_link_msg("✗ " + msg, DANGER)
 
     def show_meta(self):
         m = self.meta
+        pl = bool(m and m.get("is_playlist"))
+        caps = ("Videos", "Selected", "Length") if pl else ("Quality", "Audio", "Est. size")
+        for lb, c in zip(self.cap_lbls, caps):
+            lb.config(text=c)
         if not m:
             self.thumb.show(None)
             self.title_lbl.config(text="—")
@@ -1162,6 +1344,11 @@ class App:
         self.thumb.show(self.thumb_pil, "No preview available")
         self.title_lbl.config(text=m["title"])
         self.l_user.config(text=m["uploader"] or "—")
+        if pl:
+            self.l_site.config(text="Playlist")
+            self.l_len.config(text=f"{len(self.pl_items)} videos")
+            self.update_playlist_stats()
+            return
         self.l_site.config(text=m["site"] or "—")
         self.l_len.config(text=fmt_time(m["duration"]) if m.get("duration") else "Unknown length")
         q, a = source_quality(m)
@@ -1170,7 +1357,7 @@ class App:
         self.update_size()
 
     def update_size(self):
-        if not hasattr(self, "v_size"):
+        if not hasattr(self, "v_size") or self.is_playlist:
             return
         clip = (self.t_lo, self.t_hi) if self.trim_on and self.duration else None
         b = estimate_bytes(self.meta, self.fmt, self.qval, clip)
@@ -1200,6 +1387,8 @@ class App:
 
     # ----- trimming -----
     def trim_note_text(self):
+        if self.is_playlist:
+            return "Trimming isn't available for playlists."
         if not self.meta:
             return "Load a video first to choose a start and end."
         if not self.duration:
@@ -1241,6 +1430,9 @@ class App:
     # ----- downloading -----
     def start_download(self):
         if self.busy:
+            if self.is_playlist:   # the button says "Cancel" while a playlist runs
+                self.cancel_event.set()
+                self.set_status("Cancelling… finishing the current video first.", MUTED)
             return
         url = self.url_var.get().strip()
         if not url or url != self.loaded_url or not self.meta:
@@ -1250,6 +1442,14 @@ class App:
             self.set_status("ffmpeg not found. Run: py -m pip install imageio-ffmpeg", DANGER)
             return
         folder = str(TEMP_DIR) if self.dest == "clip" else self.folder_var.get().strip()
+        items = []
+        if self.is_playlist:
+            items = [{"url": it["url"], "title": it["var"].get().strip() or it["title"]}
+                     for it in self.pl_items if it["include"]]
+            if not items:
+                self.set_status("Select at least one video (use Show playlist).", DANGER)
+                return
+            folder = os.path.join(folder, safe_dir(self.meta["title"]))  # playlist gets its own folder
         try:
             os.makedirs(folder, exist_ok=True)
         except Exception:
@@ -1265,6 +1465,12 @@ class App:
         cfg = {"folder": folder, "fmt": self.fmt, "quality": self.qval, "clip": clip, "dest": self.dest,
                "name": safe_name(self.name_var.get()), "title": self.meta["title"]}
         self.busy = True
+        if self.is_playlist:
+            self.cancel_event.clear()
+            self.go_btn.set_text("Cancel")
+            self.on_progress(0.0, f"Starting playlist ({len(items)} videos)…")
+            threading.Thread(target=self.worker_playlist, args=(cfg, items), daemon=True).start()
+            return
         self.go_btn.set_disabled(True)
         self.on_progress(None, "Starting…" if not clip else "Downloading the selected part… this can take a moment.")
         threading.Thread(target=self.worker, args=(url, cfg), daemon=True).start()
@@ -1338,6 +1544,85 @@ class App:
             entry["err"] = clean_error(e)
             self.q.put(("failed", entry, entry["err"]))
 
+    def worker_playlist(self, cfg, items):
+        fmt, quality, folder = cfg["fmt"], cfg["quality"], cfg["folder"]
+        ext = "mp3" if fmt == "mp3" else "mp4"
+        label = ("MP4 · " + ("Best" if quality == "best" else f"{quality}p")) if fmt == "mp4" \
+            else f"MP3 · {quality}k"
+        n = len(items)
+        done = skipped = 0
+        failed = []
+        used = set()
+        cancelled = False
+        state = {"i": 0, "title": ""}
+        last = [0.0]
+
+        def hook(d):
+            if self.cancel_event.is_set():
+                raise yt_dlp.utils.DownloadCancelled("cancelled")
+            i = state["i"]
+            if d["status"] == "downloading":
+                now = time.time()
+                if now - last[0] < 0.2:
+                    return
+                last[0] = now
+                total = d.get("total_bytes") or d.get("total_bytes_estimate")
+                part = d.get("downloaded_bytes", 0) / total if total else 0.0
+                self.q.put(("progress", (i + part) / n,
+                            f"[{i + 1}/{n}] {truncate(state['title'], 50)} · {part * 100:.0f}%"))
+            elif d["status"] == "finished":
+                self.q.put(("progress", (i + 0.95) / n, f"[{i + 1}/{n}] Converting…"))
+
+        for i, it in enumerate(items):
+            if self.cancel_event.is_set():
+                cancelled = True
+                break
+            state["i"], state["title"] = i, it["title"]
+            base = (safe_name(it["title"])[:150].strip()) or f"video {i + 1}"
+            name, k = base, 2
+            while name in used:
+                name = f"{base} ({k})"
+                k += 1
+            used.add(name)
+            if os.path.exists(os.path.join(folder, name.replace("%%", "%") + "." + ext)):
+                skipped += 1   # already downloaded earlier
+                self.q.put(("progress", (i + 1) / n, f"[{i + 1}/{n}] Already exists, skipped"))
+                continue
+            opts = {"outtmpl": os.path.join(folder.replace("%", "%%"), name + ".%(ext)s"),
+                    "noplaylist": True, "quiet": True, "no_warnings": True, "logger": QuietLogger(),
+                    "progress_hooks": [hook], "windowsfilenames": True,
+                    "concurrent_fragment_downloads": 4, "ffmpeg_location": self.ffmpeg}
+            opts.update(format_opts(fmt, quality))
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    ydl.download([it["url"]])
+                done += 1
+            except yt_dlp.utils.DownloadCancelled:
+                cancelled = True
+                break
+            except Exception as e:
+                failed.append((it["title"], clean_error(e)))
+            if i < n - 1 and not self.cancel_event.is_set():
+                time.sleep(1.5)   # short pause, so YouTube doesn't get annoyed
+
+        text = f"✓ Done! {done} downloaded" if not cancelled else f"Cancelled. {done} downloaded"
+        if skipped:
+            text += f", {skipped} already existed"
+        if failed:
+            text += f", {len(failed)} failed"
+            text += "\nFailed: " + ", ".join(truncate(t, 30) for t, _ in failed[:3])
+            text += " …" if len(failed) > 3 else ""
+        part = f"{done + skipped}/{n} videos" + (f" · {len(failed)} failed" if failed else "")
+        entry = {"time": time.strftime("%H:%M"), "title": cfg["title"], "fmt": label, "part": part,
+                 "path": folder, "folder": folder, "ok": True, "err": "", "dest": "disk", "copied": False}
+        self.q.put(("playlist_done", entry, text, (done + skipped) > 0 or cancelled, cancelled))
+
+    def on_playlist_done(self, entry, text, ok, cancelled):
+        self.finish_progress(self.prog_frac if cancelled else 1.0)
+        self.set_status(text, OK if ok else DANGER)
+        self.history.append(entry)
+        self.render_history()
+
     def on_progress(self, frac, text):
         if frac is None:
             self.prog_mode = "ind"
@@ -1352,6 +1637,7 @@ class App:
         self.progress.set_fraction(value)
         self.busy = False
         self.go_btn.set_disabled(False)
+        self.go_btn.set_text(self.go_text())
 
     def on_done(self, entry):
         self.finish_progress(1.0)
@@ -1372,17 +1658,124 @@ class App:
         self.history.append(entry)
         self.render_history()
 
+    # ----- playlist -----
+    def apply_mode(self):
+        """Switch features on/off depending on single video <-> playlist."""
+        pl = self.is_playlist
+        if pl and self.dest == "clip":
+            self.dest = "disk"
+        if hasattr(self, "dest_chips"):
+            self.dest_chips.select(self.dest, notify=False)
+            self.dest_chips.set_disabled(pl)
+        if pl and self.trim_on:
+            self.trim_on = False
+            self.trim_switch.set_on(False)
+            self.trim_box.pack_forget()
+        self.trim_switch.set_disabled(pl)
+        self.trim_note.config(text=self.trim_note_text())
+        self.go_btn.set_text(self.go_text())
+        self.layout_output()
+
+    def layout_output(self):
+        """Folder / filename rows: shown or hidden depending on target + playlist."""
+        for w in (self.folder_row, self.name_row, self.name_note):
+            w.pack_forget()
+        if self.dest == "disk":
+            self.folder_row.pack(fill="x", pady=sc(5))
+        if not self.is_playlist:
+            self.name_row.pack(fill="x", pady=sc(5))
+            self.name_note.pack(fill="x", pady=(sc(4), 0))
+
+    def toggle_playlist(self):
+        self.pl_open = not self.pl_open
+        self.update_playlist_ui()
+
+    def update_playlist_ui(self):
+        if self.is_playlist:
+            self.pl_btn.pack(anchor="w", pady=(sc(12), 0))
+            self.pl_btn.set_text("Hide playlist" if self.pl_open else f"Show playlist ({len(self.pl_items)})")
+        else:
+            self.pl_btn.pack_forget()
+        if self.is_playlist and self.pl_open:
+            self.pl_panel.pack(fill="x", pady=(sc(14), 0))
+            if not self._pl_rendered:
+                self.render_playlist_rows()
+        else:
+            self.pl_panel.pack_forget()
+        self.update_playlist_stats()
+
+    def update_playlist_stats(self):
+        if not self.is_playlist:
+            return
+        sel = [it for it in self.pl_items if it["include"]]
+        total = sum(it.get("duration") or 0 for it in sel)
+        self.v_quality.config(text=str(len(self.pl_items)))
+        self.v_audio.config(text=str(len(sel)))
+        self.v_size.config(text=fmt_time(total) if total else "—")
+        self.pl_count.config(text=f"{len(sel)} of {len(self.pl_items)} selected")
+
+    def render_playlist_rows(self):
+        self._pl_rendered = True
+        self._pl_gen += 1
+        for w in self.pl_inner.winfo_children():
+            w.destroy()
+        self.pl_canvas.yview_moveto(0)
+        self._pl_batch(self._pl_gen, 0)
+
+    def _pl_batch(self, gen, start):
+        """Build the rows in small batches, so long playlists don't freeze the window."""
+        if gen != self._pl_gen:
+            return
+        try:
+            for i in range(start, min(start + 20, len(self.pl_items))):
+                self._pl_row(i)
+            if start + 20 < len(self.pl_items):
+                self.root.after(20, lambda: self._pl_batch(gen, start + 20))
+        except tk.TclError:
+            pass
+
+    def _pl_row(self, i):
+        it = self.pl_items[i]
+        row = tk.Frame(self.pl_inner, bg=PANEL2)
+        row.pack(fill="x", pady=(0, sc(2)))
+        chk = Check(row, it["include"], lambda v, it=it: self.on_item_check(it, v))
+        chk.pack(side="left", padx=(sc(10), sc(8)), pady=sc(5))
+        it["chk"] = chk
+        tk.Label(row, text=str(i + 1), width=4, anchor="e", bg=PANEL2, fg=MUTED, font=F(9)).pack(side="left")
+        dur = it.get("duration")
+        tk.Label(row, text=fmt_time(dur) if dur else "", width=7, anchor="e", bg=PANEL2, fg=MUTED,
+                 font=F(9)).pack(side="right", padx=(0, sc(10)))
+        ent = tk.Entry(row, textvariable=it["var"], bg=PANEL3, fg=TEXT, insertbackground=TEXT,
+                       relief="flat", bd=0, highlightthickness=1, highlightbackground=PANEL3,
+                       highlightcolor=ACCENT, font=F(10), selectbackground=ACCENT_SOFT,
+                       selectforeground=ACCENT)
+        ent.pack(side="left", fill="x", expand=True, padx=(sc(8), sc(8)), ipady=sc(4), pady=sc(3))
+
+    def on_item_check(self, it, v):
+        it["include"] = v
+        self.update_playlist_stats()
+
+    def select_all(self, v):
+        for it in self.pl_items:
+            it["include"] = v
+            try:
+                it["chk"].set(v)
+            except Exception:
+                pass
+        self.update_playlist_stats()
+
     # ----- clipboard mode -----
     def go_text(self):
+        if self.busy and self.is_playlist:
+            return "Cancel"
+        if self.is_playlist:
+            return "Convert & Download playlist"
         return "Convert & Copy" if self.dest == "clip" else "Convert & Download"
 
     def on_dest(self, val):
         self.dest = val
         self.go_btn.set_text(self.go_text())
-        if val == "clip":
-            self.folder_row.pack_forget()
-        else:
-            self.folder_row.pack(fill="x", pady=sc(5), before=self.name_row)
+        self.layout_output()
 
     def recopy(self, path):
         def run():
