@@ -1,10 +1,10 @@
 """
 Video Downloader
-Version: 1.1.0
+Version: 1.2.0
 Author: Mashiroto (with Claude)
 
 Description:
-Small desktop app (pop-up window) to downloads videos or audio from
+Small desktop app (pop-up window) that downloads videos or audio from
 YouTube, TikTok, Instagram and 1000+ other sites using yt-dlp.
 Everything runs locally on your PC.
 
@@ -20,8 +20,10 @@ Tip: sites change often. If a download suddenly stops working, update with:
     py -m pip install -U yt-dlp
 
 Changelog:
-- 1.0.0 (2026.11.16): Initial version (link, preview, MP4/MP3, trim, history).
-- 1.1.0 (2026.11.17): GUI update, download folder pop up, more preview informations, zoom (Ctrl + mouse wheel).
+- 1.2.0: 'Copy to clipboard' target: temporary download you can paste with Ctrl+V.
+- 1.1.0: Blue theme, rounded modern look, open-folder icon in history,
+         quality + file size in the preview, zoom (Ctrl + mouse wheel).
+- 1.0.0: Initial version (link, preview, MP4/MP3, trim, history).
 """
 import io
 import os
@@ -31,8 +33,9 @@ import shutil
 import subprocess
 import sys
 import threading
+import tempfile
 import time
-import traceback 
+import traceback
 import urllib.request
 from pathlib import Path
 import tkinter as tk
@@ -56,6 +59,7 @@ except ImportError:
     sys.exit(1)
 
 APP_TITLE = "Video Downloader"
+TEMP_DIR = Path(tempfile.gettempdir()) / "VideoDownloaderTemp"  # for "Copy to clipboard"
 RESAMPLE = getattr(Image, "Resampling", Image).LANCZOS
 
 # ---------- Colors ----------
@@ -260,6 +264,22 @@ def reveal(path, fallback_folder):
         open_path(fallback_folder)
 
 
+def copy_file_to_clipboard(path):
+    """Put the FILE on the clipboard (like Ctrl+C in Explorer). Ctrl+V then pastes it
+    into Discord, WhatsApp Web, Explorer, mails... Windows only."""
+    if not sys.platform.startswith("win") or not path:
+        return False
+    try:
+        p = str(path).replace("'", "''")
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             f"Set-Clipboard -LiteralPath '{p}'"],
+            capture_output=True, timeout=30, creationflags=0x08000000)  # no console window
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 class QuietLogger:
     """Keeps yt-dlp from printing into the console."""
     def debug(self, msg): pass
@@ -295,9 +315,9 @@ def rr_image(w, h, r, fill, outline=None, bg=BG, border=1):
     return img
 
 
-def icon_image(size, color, bgc):
+def icon_image(size, color, bgc, kind="open"):
     """The classic 'open in new window' icon (box with an arrow)."""
-    key = ("icon", size, color, bgc)
+    key = ("icon", kind, size, color, bgc)
     img = _cache.get(key)
     if img is not None:
         return img
@@ -310,10 +330,14 @@ def icon_image(size, color, bgc):
     def P(x, y):
         return (x * S, y * S)
 
-    box = [P(.46, .18), P(.18, .18), P(.18, .82), P(.82, .82), P(.82, .54)]
-    arrow1 = [P(.46, .54), P(.86, .14)]
-    arrow2 = [P(.62, .14), P(.86, .14), P(.86, .38)]
-    for pts in (box, arrow1, arrow2):
+    if kind == "copy":   # two overlapping pages
+        shapes = [[P(.34, .30), P(.34, .14), P(.86, .14), P(.86, .66), P(.70, .66)],
+                  [P(.14, .34), P(.66, .34), P(.66, .86), P(.14, .86), P(.14, .34)]]
+    else:                # box with arrow
+        shapes = [[P(.46, .18), P(.18, .18), P(.18, .82), P(.82, .82), P(.82, .54)],
+                  [P(.46, .54), P(.86, .14)],
+                  [P(.62, .14), P(.86, .14), P(.86, .38)]]
+    for pts in shapes:
         d.line(pts, fill=color, width=lw, joint="curve")
         for x, y in (pts[0], pts[-1]):  # round line ends
             d.ellipse([x - lw / 2, y - lw / 2, x + lw / 2, y + lw / 2], fill=color)
@@ -369,9 +393,10 @@ class RoundFrame(tk.Canvas):
 class Btn(tk.Canvas):
     """Rounded button. Use icon=True + size=... for the square 'open' icon button."""
     def __init__(self, parent, text="", command=None, primary=False, padx=16, pady=8,
-                 font=None, icon=False, size=None, radius=11):
+                 font=None, icon=False, size=None, radius=11, icon_kind="open"):
         self.f = font or F(10, "bold")
         self.text, self.command, self.primary, self.icon = text, command, primary, icon
+        self.icon_kind = icon_kind
         self.r = sc(radius)
         self.active = self.disabled = self.hover = False
         if size:
@@ -409,7 +434,7 @@ class Btn(tk.Canvas):
         self._img = rr_image(w, h, min(self.r, h // 2), fill, None, self._pbg)
         self.create_image(0, 0, image=self._img, anchor="nw")
         if self.icon:
-            self._ico = icon_image(max(8, int(h * 0.5)), fg, fill)
+            self._ico = icon_image(max(8, int(h * 0.5)), fg, fill, self.icon_kind)
             self.create_image(w // 2, h // 2, image=self._ico)
         else:
             self.create_text(w // 2, h // 2, text=self.text, fill=fg, font=self.f)
@@ -421,6 +446,10 @@ class Btn(tk.Canvas):
     def _click(self, e):
         if not self.disabled and self.command:
             self.command()
+
+    def set_text(self, text):
+        self.text = text
+        self._paint()
 
     def set_active(self, on):
         self.active = on
@@ -732,6 +761,7 @@ class App:
         self.start_var = tk.StringVar(value="0:00")
         self.end_var = tk.StringVar(value="0:00")
         self.fmt, self.qval = "mp4", "best"
+        self.dest = "disk"   # "disk" = save to folder, "clip" = temporary + copy to clipboard
         self.trim_on = False
         self.t_lo = self.t_hi = 0
         self.meta = None
@@ -746,6 +776,7 @@ class App:
         self.busy = False
         self._debounce = self._zoom_job = self._toast_job = self.toast = None
         self.ffmpeg = find_ffmpeg()
+        shutil.rmtree(TEMP_DIR, ignore_errors=True)  # remove temporary files of the last session
         if not self.ffmpeg:
             self.status_text, self.status_color = "ffmpeg not found. Run: py -m pip install imageio-ffmpeg", DANGER
 
@@ -834,6 +865,7 @@ class App:
     def row(self, parent, label):
         r = tk.Frame(parent, bg=PANEL)
         r.pack(fill="x", pady=sc(5))
+        self._last_row = r
         tk.Label(r, text=label, bg=PANEL, fg=MUTED, font=F(10), width=9, anchor="w").pack(side="left")
         inner = tk.Frame(r, bg=PANEL)
         inner.pack(side="left", fill="x", expand=True)
@@ -909,6 +941,10 @@ class App:
 
         # 3) Output
         body = self.card(3, "Output")
+        if sys.platform.startswith("win"):
+            self.dest_chips = Chips(self.row(body, "Target"), command=self.on_dest, padx=18, pady=7)
+            self.dest_chips.pack(anchor="w")
+            self.dest_chips.set_options([("Save to folder", "disk"), ("Copy to clipboard", "clip")], self.dest)
         self.fmt_chips = Chips(self.row(body, "Format"), command=self.on_format, padx=18, pady=7)
         self.fmt_chips.pack(anchor="w")
         self.fmt_chips.set_options([("MP4 · Video", "mp4"), ("MP3 · Audio", "mp3")], self.fmt)
@@ -916,11 +952,15 @@ class App:
         self.quality.pack(anchor="w")
         self.apply_quality_options()
 
-        fr = self.row(body, "Save to")
+        fr = self.row(body, "Folder")
+        self.folder_row = self._last_row
         Btn(fr, "Browse", self.browse, padx=16).pack(side="right", fill="y", padx=(sc(8), 0))
         RoundEntry(fr, self.folder_var).pack(side="left", fill="x", expand=True)
         nr = self.row(body, "Filename")
+        self.name_row = self._last_row
         RoundEntry(nr, self.name_var).pack(fill="x")
+        if self.dest == "clip":
+            self.folder_row.pack_forget()
         tk.Label(body, text="Filename is optional. Leave it empty to use the video title.",
                  bg=PANEL, fg=MUTED, font=F(9), anchor="w").pack(fill="x", pady=(sc(4), 0))
 
@@ -959,7 +999,7 @@ class App:
 
         # 5) Convert
         body = self.card(5, "Convert")
-        self.go_btn = Btn(body, "Convert & Download", self.start_download, primary=True,
+        self.go_btn = Btn(body, self.go_text(), self.start_download, primary=True,
                           font=F(12, "bold"), pady=12, radius=14)
         self.go_btn.pack(fill="x")
         self.go_btn.set_disabled(self.busy)
@@ -978,7 +1018,7 @@ class App:
         br.pack(fill="x", pady=(sc(6), 0))
         Btn(br, "Open folder", lambda: open_path(self.folder_var.get()), padx=14, pady=6).pack(side="left")
         Btn(br, "Clear history", self.clear_history, padx=14, pady=6).pack(side="left", padx=(sc(8), 0))
-        tk.Label(body, text="Click the icon on the right of a download to open its folder. "
+        tk.Label(body, text="Click the icon on the right of a download to open its folder (or copy it again). "
                             "History is cleared when you close the app.",
                  bg=PANEL, fg=MUTED, font=F(8), anchor="w", justify="left").pack(fill="x", pady=(sc(10), 0))
         tk.Frame(self.page, bg=BG, height=sc(20)).pack()
@@ -1209,7 +1249,7 @@ class App:
         if not self.ffmpeg:
             self.set_status("ffmpeg not found. Run: py -m pip install imageio-ffmpeg", DANGER)
             return
-        folder = self.folder_var.get().strip()
+        folder = str(TEMP_DIR) if self.dest == "clip" else self.folder_var.get().strip()
         try:
             os.makedirs(folder, exist_ok=True)
         except Exception:
@@ -1222,7 +1262,7 @@ class App:
                 return
             self.commit_trim()
             clip = (self.t_lo, self.t_hi)
-        cfg = {"folder": folder, "fmt": self.fmt, "quality": self.qval, "clip": clip,
+        cfg = {"folder": folder, "fmt": self.fmt, "quality": self.qval, "clip": clip, "dest": self.dest,
                "name": safe_name(self.name_var.get()), "title": self.meta["title"]}
         self.busy = True
         self.go_btn.set_disabled(True)
@@ -1235,7 +1275,8 @@ class App:
             else f"MP3 · {quality}k"
         entry = {"time": time.strftime("%H:%M"), "title": cfg["title"], "fmt": label,
                  "part": f"{fmt_time(clip[0])}–{fmt_time(clip[1])}" if clip else "Full video",
-                 "path": None, "folder": cfg["folder"], "ok": True, "err": ""}
+                 "path": None, "folder": cfg["folder"], "ok": True, "err": "",
+                 "dest": cfg["dest"], "copied": False}
         last = [0.0]
 
         def hook(d):
@@ -1263,6 +1304,8 @@ class App:
             "progress_hooks": [hook], "windowsfilenames": True,
             "concurrent_fragment_downloads": 4, "ffmpeg_location": self.ffmpeg,
         }
+        if cfg["dest"] == "clip":
+            opts["overwrites"] = True  # a temporary file with the same name gets replaced
         if fmt == "mp3":
             opts["format"] = "bestaudio/best"
             opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3",
@@ -1286,6 +1329,9 @@ class App:
                 if not path:
                     path = ydl.prepare_filename(info)
             entry["path"] = path
+            if cfg["dest"] == "clip":
+                self.q.put(("progress", None, "Copying to clipboard…"))
+                entry["copied"] = copy_file_to_clipboard(path)
             self.q.put(("done", entry))
         except Exception as e:
             entry["ok"] = False
@@ -1310,7 +1356,13 @@ class App:
     def on_done(self, entry):
         self.finish_progress(1.0)
         name = os.path.basename(entry["path"]) if entry["path"] else ""
-        self.set_status(f"✓ Done! Saved as: {name}", OK)
+        if entry.get("dest") == "clip":
+            if entry["copied"]:
+                self.set_status("✓ Copied! Press Ctrl+V where you want the file.", OK)
+            else:
+                self.set_status(f"Downloaded, but copying failed. The file is here: {entry['path']}", DANGER)
+        else:
+            self.set_status(f"✓ Done! Saved as: {name}", OK)
         self.history.append(entry)
         self.render_history()
 
@@ -1319,6 +1371,30 @@ class App:
         self.set_status("✗ " + msg, DANGER)
         self.history.append(entry)
         self.render_history()
+
+    # ----- clipboard mode -----
+    def go_text(self):
+        return "Convert & Copy" if self.dest == "clip" else "Convert & Download"
+
+    def on_dest(self, val):
+        self.dest = val
+        self.go_btn.set_text(self.go_text())
+        if val == "clip":
+            self.folder_row.pack_forget()
+        else:
+            self.folder_row.pack(fill="x", pady=sc(5), before=self.name_row)
+
+    def recopy(self, path):
+        def run():
+            ok = bool(path) and os.path.exists(path) and copy_file_to_clipboard(path)
+            if ok:
+                self.q.put(("status", "✓ Copied again! Press Ctrl+V where you want the file.", OK))
+            else:
+                self.q.put(("status", "That temporary file is gone. Please download it again.", DANGER))
+        threading.Thread(target=run, daemon=True).start()
+
+    def on_status(self, text, color):
+        self.set_status(text, color)
 
     # ----- history -----
     def render_history(self):
@@ -1339,12 +1415,17 @@ class App:
             tk.Label(b, text=truncate(e["title"], 70), bg=PANEL2, fg=TEXT, font=F(10, "bold"),
                      anchor="w").grid(row=0, column=1, sticky="we")
             sub = f'{e["fmt"]} · {e["part"]}' if e["ok"] else e["err"]
+            if e["ok"] and e.get("dest") == "clip":
+                sub += " · temporary copy"
             tk.Label(b, text=truncate(sub, 90), bg=PANEL2, fg=MUTED if e["ok"] else DANGER,
                      font=F(9), anchor="w").grid(row=1, column=1, sticky="we")
             if e["ok"]:
-                Btn(b, command=lambda p=e["path"], f=e["folder"]: reveal(p, f), icon=True,
-                    size=sc(36), radius=11).grid(row=0, column=2, rowspan=2, sticky="e",
-                                                 padx=(sc(12), 0))
+                if e.get("dest") == "clip" and e.get("copied"):
+                    cmd, kind = (lambda p=e["path"]: self.recopy(p)), "copy"   # copy again
+                else:
+                    cmd, kind = (lambda p=e["path"], f=e["folder"]: reveal(p, f)), "open"
+                Btn(b, command=cmd, icon=True, icon_kind=kind, size=sc(36), radius=11).grid(
+                    row=0, column=2, rowspan=2, sticky="e", padx=(sc(12), 0))
             else:
                 tk.Label(b, text="✗", bg=PANEL2, fg=DANGER, font=F(13, "bold")).grid(
                     row=0, column=2, rowspan=2, sticky="e", padx=(sc(12), 0))
