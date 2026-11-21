@@ -1,6 +1,6 @@
 """
 Video Downloader
-Version: 1.3.0
+Version: 1.3.1
 Author: Mashiroto (with Claude)
 
 Description:
@@ -20,6 +20,7 @@ Tip: sites change often. If a download suddenly stops working, update with:
     py -m pip install -U yt-dlp
 
 Changelog:
+- 1.3.1: Playlist numbering (none / #001 / 01 of 75) and drag-to-reorder in the list.
 - 1.3.0: Playlists: detected automatically, list with check boxes + editable titles,
          downloads one after another (Cancel button, skips files that already exist).
 - 1.2.0: 'Copy to clipboard' target: temporary download you can paste with Ctrl+V.
@@ -252,6 +253,15 @@ def format_opts(fmt, quality):
     res = "res" if quality == "best" else f"res:{quality}"
     return {"format": "bv*+ba/b", "format_sort": [res, "ext:mp4:m4a"], "merge_output_format": "mp4",
             "postprocessors": [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}]}
+
+
+def number_prefix(mode, pos, total):
+    """'#001 - ' or '01 of 75 - ' (a '/' is not allowed in Windows file names)."""
+    if mode == "hash":
+        return f"#{pos:0{max(3, len(str(total)))}d} - "
+    if mode == "of":
+        return f"{pos:0{len(str(total))}d} of {total} - "
+    return ""
 
 
 def open_path(path):
@@ -860,6 +870,8 @@ class App:
         self.dest = "disk"   # "disk" = save to folder, "clip" = temporary + copy to clipboard
         self.is_playlist, self.pl_items, self.pl_open = False, [], False
         self._pl_gen, self._pl_rendered = 0, False
+        self.num_mode = "none"     # playlist numbering: none / hash / of
+        self._drag_it = None
         self.cancel_event = threading.Event()
         self.trim_on = False
         self.t_lo = self.t_hi = 0
@@ -965,7 +977,7 @@ class App:
         r = tk.Frame(parent, bg=PANEL)
         r.pack(fill="x", pady=sc(5))
         self._last_row = r
-        tk.Label(r, text=label, bg=PANEL, fg=MUTED, font=F(10), width=9, anchor="w").pack(side="left")
+        tk.Label(r, text=label, bg=PANEL, fg=MUTED, font=F(10), width=11, anchor="w").pack(side="left")
         inner = tk.Frame(r, bg=PANEL)
         inner.pack(side="left", fill="x", expand=True)
         return inner
@@ -1077,6 +1089,13 @@ class App:
         self.quality = Chips(self.row(body, "Quality"), command=self.on_quality)
         self.quality.pack(anchor="w")
         self.apply_quality_options()
+        nrow = self.row(body, "Numbering")
+        self.num_row = self._last_row
+        self.num_chips = Chips(nrow, command=self.on_numbering)
+        self.num_chips.pack(side="left")
+        self.num_chips.set_options([("No numbers", "none"), ("#001", "hash"), ("1 of 75", "of")], self.num_mode)
+        self.num_example = tk.Label(nrow, text="", bg=PANEL, fg=MUTED, font=F(9))
+        self.num_example.pack(side="left", padx=(sc(10), 0))
 
         fr = self.row(body, "Folder")
         self.folder_row = self._last_row
@@ -1444,8 +1463,8 @@ class App:
         folder = str(TEMP_DIR) if self.dest == "clip" else self.folder_var.get().strip()
         items = []
         if self.is_playlist:
-            items = [{"url": it["url"], "title": it["var"].get().strip() or it["title"]}
-                     for it in self.pl_items if it["include"]]
+            items = [{"url": it["url"], "title": it["var"].get().strip() or it["title"], "pos": k + 1}
+                     for k, it in enumerate(self.pl_items) if it["include"]]
             if not items:
                 self.set_status("Select at least one video (use Show playlist).", DANGER)
                 return
@@ -1462,7 +1481,7 @@ class App:
                 return
             self.commit_trim()
             clip = (self.t_lo, self.t_hi)
-        cfg = {"folder": folder, "fmt": self.fmt, "quality": self.qval, "clip": clip, "dest": self.dest,
+        cfg = {"folder": folder, "fmt": self.fmt, "quality": self.qval, "clip": clip, "dest": self.dest, "num": self.num_mode, "total": len(self.pl_items),
                "name": safe_name(self.name_var.get()), "title": self.meta["title"]}
         self.busy = True
         if self.is_playlist:
@@ -1578,7 +1597,8 @@ class App:
                 cancelled = True
                 break
             state["i"], state["title"] = i, it["title"]
-            base = (safe_name(it["title"])[:150].strip()) or f"video {i + 1}"
+            prefix = number_prefix(cfg.get("num"), it.get("pos", i + 1), cfg.get("total", n))
+            base = (safe_name(prefix + it["title"])[:150].strip()) or f"video {i + 1}"
             name, k = base, 2
             while name in used:
                 name = f"{base} ({k})"
@@ -1675,16 +1695,27 @@ class App:
         self.trim_note.config(text=self.trim_note_text())
         self.go_btn.set_text(self.go_text())
         self.layout_output()
+        self.update_num_example()
 
     def layout_output(self):
-        """Folder / filename rows: shown or hidden depending on target + playlist."""
-        for w in (self.folder_row, self.name_row, self.name_note):
+        """Numbering / folder / filename rows: shown or hidden depending on target + playlist."""
+        for w in (self.num_row, self.folder_row, self.name_row, self.name_note):
             w.pack_forget()
+        if self.is_playlist:
+            self.num_row.pack(fill="x", pady=sc(5))
         if self.dest == "disk":
             self.folder_row.pack(fill="x", pady=sc(5))
         if not self.is_playlist:
             self.name_row.pack(fill="x", pady=sc(5))
             self.name_note.pack(fill="x", pady=(sc(4), 0))
+
+    def on_numbering(self, val):
+        self.num_mode = val
+        self.update_num_example()
+
+    def update_num_example(self):
+        total = len(self.pl_items) or 75
+        self.num_example.config(text="e.g.  " + number_prefix(self.num_mode, 1, total) + "Song name")
 
     def toggle_playlist(self):
         self.pl_open = not self.pl_open
@@ -1712,7 +1743,7 @@ class App:
         self.v_quality.config(text=str(len(self.pl_items)))
         self.v_audio.config(text=str(len(sel)))
         self.v_size.config(text=fmt_time(total) if total else "—")
-        self.pl_count.config(text=f"{len(sel)} of {len(self.pl_items)} selected")
+        self.pl_count.config(text=f"{len(sel)} of {len(self.pl_items)} selected  ·  drag ≡ to reorder")
 
     def render_playlist_rows(self):
         self._pl_rendered = True
@@ -1738,10 +1769,23 @@ class App:
         it = self.pl_items[i]
         row = tk.Frame(self.pl_inner, bg=PANEL2)
         row.pack(fill="x", pady=(0, sc(2)))
+        it["row"] = row
+        # drag handle (three lines): press and drag up/down to change the order
+        hd = tk.Canvas(row, width=sc(20), height=sc(22), bg=PANEL2, highlightthickness=0, bd=0,
+                       cursor="fleur")
+        for k in range(3):
+            y = sc(6) + k * sc(5)
+            hd.create_line(sc(3), y, sc(17), y, width=sc(2), fill=MUTED, capstyle="round", tags="ln")
+        hd.pack(side="left", padx=(sc(8), 0), pady=sc(5))
+        hd.bind("<ButtonPress-1>", lambda e, it=it, hd=hd: self._drag_start(it, hd))
+        hd.bind("<B1-Motion>", self._drag_move)
+        hd.bind("<ButtonRelease-1>", lambda e, hd=hd: self._drag_end(hd))
         chk = Check(row, it["include"], lambda v, it=it: self.on_item_check(it, v))
-        chk.pack(side="left", padx=(sc(10), sc(8)), pady=sc(5))
+        chk.pack(side="left", padx=(sc(8), sc(8)), pady=sc(5))
         it["chk"] = chk
-        tk.Label(row, text=str(i + 1), width=4, anchor="e", bg=PANEL2, fg=MUTED, font=F(9)).pack(side="left")
+        num = tk.Label(row, text=str(i + 1), width=4, anchor="e", bg=PANEL2, fg=MUTED, font=F(9))
+        num.pack(side="left")
+        it["num"] = num
         dur = it.get("duration")
         tk.Label(row, text=fmt_time(dur) if dur else "", width=7, anchor="e", bg=PANEL2, fg=MUTED,
                  font=F(9)).pack(side="right", padx=(0, sc(10)))
@@ -1750,6 +1794,71 @@ class App:
                        highlightcolor=ACCENT, font=F(10), selectbackground=ACCENT_SOFT,
                        selectforeground=ACCENT)
         ent.pack(side="left", fill="x", expand=True, padx=(sc(8), sc(8)), ipady=sc(4), pady=sc(3))
+
+    def _drag_start(self, it, handle):
+        self._drag_it = it
+        handle.itemconfigure("ln", fill=ACCENT)
+
+    def _drag_move(self, e):
+        it = self._drag_it
+        if it is None or it.get("row") is None:
+            return
+        y = e.y_root
+        try:   # scroll the list when the mouse is near its top / bottom edge
+            top = self.pl_canvas.winfo_rooty()
+            bottom = top + self.pl_canvas.winfo_height()
+            if y < top + sc(24):
+                self.pl_canvas.yview_scroll(-1, "units")
+            elif y > bottom - sc(24):
+                self.pl_canvas.yview_scroll(1, "units")
+        except Exception:
+            pass
+        target = None            # which row is the mouse over?
+        for other in self.pl_items:
+            r = other.get("row")
+            if r is None:
+                continue
+            try:
+                ry, rh = r.winfo_rooty(), r.winfo_height()
+            except Exception:
+                continue
+            if ry <= y < ry + rh:
+                target = other
+                break
+        if target is None or target is it:
+            return
+        cur, j = self.pl_items.index(it), self.pl_items.index(target)
+        row = it["row"]
+        try:                     # move only this one row in the window ...
+            row.pack_forget()
+            if j < cur:
+                row.pack(fill="x", pady=(0, sc(2)), before=target["row"])
+            else:
+                nxt = self.pl_items[j + 1] if j + 1 < len(self.pl_items) else None
+                if nxt is not None and nxt.get("row") is not None:
+                    row.pack(fill="x", pady=(0, sc(2)), before=nxt["row"])
+                else:
+                    row.pack(fill="x", pady=(0, sc(2)))
+        except tk.TclError:
+            return
+        self.pl_items.insert(j, self.pl_items.pop(cur))   # ... and in the list
+        self._renumber(min(cur, j), max(cur, j))
+        self.pl_inner.update_idletasks()
+
+    def _drag_end(self, handle):
+        self._drag_it = None
+        try:
+            handle.itemconfigure("ln", fill=MUTED)
+        except Exception:
+            pass
+
+    def _renumber(self, a, b):
+        for k in range(a, b + 1):
+            lb = self.pl_items[k].get("num")
+            try:
+                lb.config(text=str(k + 1))
+            except Exception:
+                pass
 
     def on_item_check(self, it, v):
         it["include"] = v
