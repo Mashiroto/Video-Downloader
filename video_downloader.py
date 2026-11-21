@@ -1,6 +1,6 @@
 """
 Video Downloader
-Version: 1.3.1
+Version: 1.3.2
 Author: Mashiroto (with Claude)
 
 Description:
@@ -20,6 +20,8 @@ Tip: sites change often. If a download suddenly stops working, update with:
     py -m pip install -U yt-dlp
 
 Changelog:
+- 1.3.2: Darker blue, starts maximized + centered, simple scroll bar, copy button in history,
+         seconds on hover, trimming works with the bundled ffmpeg.
 - 1.3.1: Playlist numbering (none / #001 / 01 of 75) and drag-to-reorder in the list.
 - 1.3.0: Playlists: detected automatically, list with check boxes + editable titles,
          downloads one after another (Cancel button, skips files that already exist).
@@ -74,9 +76,9 @@ BORDER = "#22242a"
 BORDER_STRONG = "#3a3d45"
 TEXT = "#f3f1ec"
 MUTED = "#8c8e96"
-ACCENT = "#4aa3ff"          # bright blue
-ACCENT_HOVER = "#7bbcff"
-ACCENT_SOFT = "#17324f"
+ACCENT = "#3b8eea"          # blue
+ACCENT_HOVER = "#5fa6f2"
+ACCENT_SOFT = "#15304d"
 ON_ACCENT = "#04172b"       # text on top of the accent color
 DANGER = "#ef6461"
 OK = "#6fcf97"
@@ -114,11 +116,27 @@ def F(size, weight="normal"):
 # ---------- Pure helpers (no GUI) ----------
 def find_ffmpeg():
     """ffmpeg is needed for MP3, merging video+audio and trimming."""
+    found = shutil.which("ffmpeg")          # a normal ffmpeg install always wins
+    if found:
+        return found
     try:
         import imageio_ffmpeg
-        return imageio_ffmpeg.get_ffmpeg_exe()
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
-        return shutil.which("ffmpeg")
+        return None
+    # When it cuts a video, yt-dlp only looks for a file called "ffmpeg" on the PATH (it ignores the
+    # location we give it). The bundled file has a longer name, so we put a copy called "ffmpeg"
+    # into a small folder and add that folder to the PATH of this program (only while it runs).
+    try:
+        bindir = Path(tempfile.gettempdir()) / "VideoDownloaderBin"
+        target = bindir / ("ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg")
+        if not target.exists():
+            bindir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(exe, target)
+        os.environ["PATH"] = str(bindir) + os.pathsep + os.environ.get("PATH", "")
+        return str(target)
+    except Exception:
+        return exe
 
 
 def parse_time(text):
@@ -456,6 +474,7 @@ class Btn(tk.Canvas):
         self._padx = padx
         self.r = sc(radius)
         self.active = self.disabled = self.hover = False
+        self.ok_flash = False
         if size:
             w = h = size
         else:
@@ -474,6 +493,8 @@ class Btn(tk.Canvas):
     def _colors(self):
         if self.disabled:
             return (ACCENT_SOFT, MUTED) if self.active else (PANEL3, MUTED)
+        if self.icon and self.ok_flash:
+            return "#1f3d2c", OK
         if self.icon:
             return (ACCENT_SOFT, ACCENT_HOVER) if self.hover else (PANEL3, ACCENT)
         if self.primary or self.active:
@@ -518,6 +539,19 @@ class Btn(tk.Canvas):
         self.disabled = on
         self.configure(cursor="arrow" if on else "hand2")
         self._paint()
+
+    def flash_ok(self, ms=1200):
+        """Turn green for a moment (feedback: 'copied')."""
+        self.ok_flash = True
+        self._paint()
+        self.winfo_toplevel().after(ms, self._unflash)
+
+    def _unflash(self):
+        try:
+            self.ok_flash = False
+            self._paint()
+        except Exception:
+            pass
 
 
 class Chips(tk.Frame):
@@ -625,6 +659,70 @@ class Check(tk.Canvas):
     def set(self, on):
         self.on = on
         self._paint()
+
+
+class SlimScroll(tk.Canvas):
+    """Thin, simple scroll bar: just a rounded handle (no arrows, no grip lines)."""
+    def __init__(self, parent, command, bg=BG, width=12):
+        super().__init__(parent, width=sc(width), bg=bg, highlightthickness=0, bd=0)
+        self._pbg, self.command = bg, command
+        self.first, self.last = 0.0, 1.0
+        self.hover = self.drag = False
+        self._off = 0
+        self._img = None
+        self.bind("<Configure>", lambda e: self._draw())
+        self.bind("<Enter>", lambda e: self._set_hover(True))
+        self.bind("<Leave>", lambda e: self._set_hover(False))
+        self.bind("<Button-1>", self._press)
+        self.bind("<B1-Motion>", self._move)
+        self.bind("<ButtonRelease-1>", self._release)
+
+    def set(self, first, last):          # called by the scrolled widget
+        self.first, self.last = float(first), float(last)
+        self._draw()
+
+    def _thumb(self):
+        h = max(1, self.winfo_height())
+        top, bot = int(self.first * h), int(self.last * h)
+        if bot - top < sc(30):
+            bot = top + sc(30)
+        if bot > h:
+            bot, top = h, max(0, h - sc(30))
+        return top, bot
+
+    def _draw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 4 or h < 4 or (self.first <= 0.0 and self.last >= 1.0):
+            return                       # everything fits: no handle needed
+        top, bot = self._thumb()
+        col = ACCENT if self.drag else ("#555963" if self.hover else "#33363d")
+        pad = sc(2)
+        tw = max(2, w - 2 * pad)
+        self._img = rr_image(tw, max(2, bot - top), tw // 2, col, None, self._pbg)
+        self.create_image(pad, top, image=self._img, anchor="nw")
+
+    def _set_hover(self, on):
+        self.hover = on
+        self._draw()
+
+    def _press(self, e):
+        top, bot = self._thumb()
+        if top <= e.y <= bot:
+            self._off = e.y - top
+        else:
+            self._off = (bot - top) // 2   # click beside the handle: jump there
+            self._move(e)
+        self.drag = True
+        self._draw()
+
+    def _move(self, e):
+        h = max(1, self.winfo_height())
+        self.command("moveto", max(0.0, min(1.0, (e.y - self._off) / h)))
+
+    def _release(self, e):
+        self.drag = False
+        self._draw()
 
 
 class Pill(tk.Canvas):
@@ -892,9 +990,19 @@ class App:
             self.status_text, self.status_color = "ffmpeg not found. Run: py -m pip install imageio-ffmpeg", DANGER
 
         root.title(APP_TITLE)
-        root.geometry("860x960")
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = min(980, sw - 80), min(940, sh - 120)
+        # centered on the screen (this size is used when you un-maximize the window)
+        root.geometry(f"{w}x{h}+{(sw - w) // 2}+{max(0, (sh - h) // 2 - 20)}")
         root.minsize(640, 600)
         root.configure(bg=BG)
+        try:
+            root.state("zoomed")                       # start maximized (Windows)
+        except tk.TclError:
+            try:
+                root.attributes("-zoomed", True)       # Linux
+            except tk.TclError:
+                pass
 
         style = ttk.Style()
         style.theme_use("clam")
@@ -987,10 +1095,10 @@ class App:
         self._pl_gen += 1          # stops row-building of a previous window
         self._pl_rendered = False
         self.canvas = tk.Canvas(self.root, bg=BG, highlightthickness=0)
-        self.sb = ttk.Scrollbar(self.root, orient="vertical", command=self.canvas.yview)
+        self.sb = SlimScroll(self.root, self.canvas.yview, bg=BG, width=12)
         self.canvas.configure(yscrollcommand=self.sb.set)
-        self.sb.pack(side="right", fill="y")
-        self.canvas.pack(side="left", fill="both", expand=True)
+        self.canvas.pack(fill="both", expand=True)       # full width -> the cards are centered
+        self.sb.place(relx=1.0, rely=0.0, relheight=1.0, anchor="ne")   # scroll bar floats on the right edge
         self.page = tk.Frame(self.canvas, bg=BG)
         self.win = self.canvas.create_window((0, 0), window=self.page, anchor="n")
         self.page.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
@@ -1067,7 +1175,7 @@ class App:
         lf = RoundFrame(self.pl_panel, fill=PANEL2, outline=BORDER, radius=14, padx=6, pady=6)
         lf.pack(fill="x")
         self.pl_canvas = tk.Canvas(lf.body, bg=PANEL2, highlightthickness=0, bd=0, height=sc(320))
-        psb = ttk.Scrollbar(lf.body, orient="vertical", command=self.pl_canvas.yview)
+        psb = SlimScroll(lf.body, self.pl_canvas.yview, bg=PANEL2, width=10)
         self.pl_canvas.configure(yscrollcommand=psb.set)
         psb.pack(side="right", fill="y")
         self.pl_canvas.pack(side="left", fill="x", expand=True)
@@ -1162,7 +1270,7 @@ class App:
         br.pack(fill="x", pady=(sc(6), 0))
         Btn(br, "Open folder", lambda: open_path(self.folder_var.get()), padx=14, pady=6).pack(side="left")
         Btn(br, "Clear history", self.clear_history, padx=14, pady=6).pack(side="left", padx=(sc(8), 0))
-        tk.Label(body, text="Click the icon on the right of a download to open its folder (or copy it again). "
+        tk.Label(body, text="Use the icons on the right of a download: copy the file or open its folder. "
                             "History is cleared when you close the app.",
                  bg=PANEL, fg=MUTED, font=F(8), anchor="w", justify="left").pack(fill="x", pady=(sc(10), 0))
         tk.Frame(self.page, bg=BG, height=sc(20)).pack()
@@ -1498,7 +1606,7 @@ class App:
         fmt, quality, clip = cfg["fmt"], cfg["quality"], cfg["clip"]
         label = ("MP4 · " + ("Best" if quality == "best" else f"{quality}p")) if fmt == "mp4" \
             else f"MP3 · {quality}k"
-        entry = {"time": time.strftime("%H:%M"), "title": cfg["title"], "fmt": label,
+        entry = {"time": time.strftime("%H:%M"), "time_full": time.strftime("%H:%M:%S"), "title": cfg["title"], "fmt": label,
                  "part": f"{fmt_time(clip[0])}–{fmt_time(clip[1])}" if clip else "Full video",
                  "path": None, "folder": cfg["folder"], "ok": True, "err": "",
                  "dest": cfg["dest"], "copied": False}
@@ -1633,8 +1741,9 @@ class App:
             text += "\nFailed: " + ", ".join(truncate(t, 30) for t, _ in failed[:3])
             text += " …" if len(failed) > 3 else ""
         part = f"{done + skipped}/{n} videos" + (f" · {len(failed)} failed" if failed else "")
-        entry = {"time": time.strftime("%H:%M"), "title": cfg["title"], "fmt": label, "part": part,
-                 "path": folder, "folder": folder, "ok": True, "err": "", "dest": "disk", "copied": False}
+        entry = {"time": time.strftime("%H:%M"), "time_full": time.strftime("%H:%M:%S"), "title": cfg["title"], "fmt": label, "part": part,
+                 "path": folder, "folder": folder, "ok": True, "err": "", "dest": "disk", "copied": False,
+                 "playlist": True}
         self.q.put(("playlist_done", entry, text, (done + skipped) > 0 or cancelled, cancelled))
 
     def on_playlist_done(self, entry, text, ok, cancelled):
@@ -1886,14 +1995,22 @@ class App:
         self.go_btn.set_text(self.go_text())
         self.layout_output()
 
-    def recopy(self, path):
+    def recopy(self, path, btn=None):
         def run():
             ok = bool(path) and os.path.exists(path) and copy_file_to_clipboard(path)
             if ok:
-                self.q.put(("status", "✓ Copied again! Press Ctrl+V where you want the file.", OK))
+                self.q.put(("status", "✓ Copied! Press Ctrl+V where you want the file.", OK))
+                if btn is not None:
+                    self.q.put(("flash", btn))
             else:
-                self.q.put(("status", "That temporary file is gone. Please download it again.", DANGER))
+                self.q.put(("status", "Couldn't copy: the file isn't there anymore (moved or deleted).", DANGER))
         threading.Thread(target=run, daemon=True).start()
+
+    def on_flash(self, btn):
+        try:
+            btn.flash_ok()
+        except Exception:
+            pass
 
     def on_status(self, text, color):
         self.set_status(text, color)
@@ -1912,8 +2029,10 @@ class App:
             b = tk.Frame(row.body, bg=PANEL2)
             b.pack(fill="x")
             b.grid_columnconfigure(1, weight=1)
-            tk.Label(b, text=e["time"], bg=PANEL2, fg=MUTED, font=F(9)).grid(
-                row=0, column=0, rowspan=2, sticky="w", padx=(0, sc(14)))
+            tm = tk.Label(b, text=e["time"], width=8, anchor="w", bg=PANEL2, fg=MUTED, font=F(9))
+            tm.grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, sc(10)))
+            tm.bind("<Enter>", lambda ev, lb=tm, t=e.get("time_full", e["time"]): lb.config(text=t, fg=TEXT))
+            tm.bind("<Leave>", lambda ev, lb=tm, t=e["time"]: lb.config(text=t, fg=MUTED))
             tk.Label(b, text=truncate(e["title"], 70), bg=PANEL2, fg=TEXT, font=F(10, "bold"),
                      anchor="w").grid(row=0, column=1, sticky="we")
             sub = f'{e["fmt"]} · {e["part"]}' if e["ok"] else e["err"]
@@ -1922,12 +2041,14 @@ class App:
             tk.Label(b, text=truncate(sub, 90), bg=PANEL2, fg=MUTED if e["ok"] else DANGER,
                      font=F(9), anchor="w").grid(row=1, column=1, sticky="we")
             if e["ok"]:
-                if e.get("dest") == "clip" and e.get("copied"):
-                    cmd, kind = (lambda p=e["path"]: self.recopy(p)), "copy"   # copy again
-                else:
-                    cmd, kind = (lambda p=e["path"], f=e["folder"]: reveal(p, f)), "open"
-                Btn(b, command=cmd, icon=True, icon_kind=kind, size=sc(36), radius=11).grid(
-                    row=0, column=2, rowspan=2, sticky="e", padx=(sc(12), 0))
+                bf = tk.Frame(b, bg=PANEL2)
+                bf.grid(row=0, column=2, rowspan=2, sticky="e", padx=(sc(12), 0))
+                if sys.platform.startswith("win") and e.get("path") and not e.get("playlist"):
+                    cb = Btn(bf, icon=True, icon_kind="copy", size=sc(36), radius=11)   # copy the file
+                    cb.command = lambda p=e["path"], bt=cb: self.recopy(p, bt)
+                    cb.pack(side="left", padx=(0, sc(8)))
+                Btn(bf, command=lambda p=e["path"], f=e["folder"]: reveal(p, f), icon=True,   # open folder
+                    icon_kind="open", size=sc(36), radius=11).pack(side="left")
             else:
                 tk.Label(b, text="✗", bg=PANEL2, fg=DANGER, font=F(13, "bold")).grid(
                     row=0, column=2, rowspan=2, sticky="e", padx=(sc(12), 0))
