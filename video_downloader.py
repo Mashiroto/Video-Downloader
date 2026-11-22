@@ -1,6 +1,6 @@
 """
 Video Downloader
-Version: 1.3.2
+Version: 1.3.3
 Author: Mashiroto (with Claude)
 
 Description:
@@ -20,6 +20,7 @@ Tip: sites change often. If a download suddenly stops working, update with:
     py -m pip install -U yt-dlp
 
 Changelog:
+- 1.3.3: Cards centered correctly, numbering button shows the real count (1/89).
 - 1.3.2: Darker blue, starts maximized + centered, simple scroll bar, copy button in history,
          seconds on hover, trimming works with the bundled ffmpeg.
 - 1.3.1: Playlist numbering (none / #001 / 01 of 75) and drag-to-reorder in the list.
@@ -91,6 +92,7 @@ else:
     FONT = "DejaVu Sans"
 
 ZOOMS = [0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0]
+NUM_SEP = "\u2215"   # looks like "/", but (unlike a real /) it is allowed in file names
 SCALE = 1.0  # current zoom factor, changed by Ctrl + mouse wheel
 
 MP4_Q = [("Best", "best"), ("1080p", 1080), ("720p", 720), ("480p", 480), ("360p", 360)]
@@ -274,11 +276,11 @@ def format_opts(fmt, quality):
 
 
 def number_prefix(mode, pos, total):
-    """'#001 - ' or '01 of 75 - ' (a '/' is not allowed in Windows file names)."""
+    """'#001 - ' or '01∕75 - ' (a real '/' is not allowed in Windows file names)."""
     if mode == "hash":
         return f"#{pos:0{max(3, len(str(total)))}d} - "
     if mode == "of":
-        return f"{pos:0{len(str(total))}d} of {total} - "
+        return f"{pos:0{len(str(total))}d}{NUM_SEP}{total} - "
     return ""
 
 
@@ -1101,7 +1103,7 @@ class App:
         self.sb.place(relx=1.0, rely=0.0, relheight=1.0, anchor="ne")   # scroll bar floats on the right edge
         self.page = tk.Frame(self.canvas, bg=BG)
         self.win = self.canvas.create_window((0, 0), window=self.page, anchor="n")
-        self.page.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.page.bind("<Configure>", self._update_region)
         self.canvas.bind("<Configure>", self.on_canvas_resize)
 
         # Header
@@ -1201,7 +1203,7 @@ class App:
         self.num_row = self._last_row
         self.num_chips = Chips(nrow, command=self.on_numbering)
         self.num_chips.pack(side="left")
-        self.num_chips.set_options([("No numbers", "none"), ("#001", "hash"), ("1 of 75", "of")], self.num_mode)
+        self.num_chips.set_options([("No numbers", "none"), ("#001", "hash"), ("1/75", "of")], self.num_mode)
         self.num_example = tk.Label(nrow, text="", bg=PANEL, fg=MUTED, font=F(9))
         self.num_example.pack(side="left", padx=(sc(10), 0))
 
@@ -1288,7 +1290,15 @@ class App:
     # ----- scrolling / layout -----
     def on_canvas_resize(self, e):
         self.canvas.itemconfigure(self.win, width=min(e.width - sc(40), sc(820)))
-        self.canvas.coords(self.win, e.width // 2, 0)
+        self.canvas.coords(self.win, e.width // 2, 0)     # middle of the window
+        self._update_region()
+
+    def _update_region(self, e=None):
+        """Scrollable area = full window width (starts at x=0) x page height.
+        (Taking the cards' own bounding box made the cards drift sideways.)"""
+        w = self.canvas.winfo_width()
+        h = max(self.page.winfo_reqheight(), self.canvas.winfo_height())
+        self.canvas.configure(scrollregion=(0, 0, w, h))
 
     @staticmethod
     def _inside(w, container):
@@ -1804,6 +1814,7 @@ class App:
         self.trim_note.config(text=self.trim_note_text())
         self.go_btn.set_text(self.go_text())
         self.layout_output()
+        self.refresh_num_chips()
         self.update_num_example()
 
     def layout_output(self):
@@ -1817,6 +1828,12 @@ class App:
         if not self.is_playlist:
             self.name_row.pack(fill="x", pady=sc(5))
             self.name_note.pack(fill="x", pady=(sc(4), 0))
+
+    def refresh_num_chips(self):
+        """The last button shows the real number of videos, e.g. 1/89."""
+        total = len(self.pl_items) or 75
+        self.num_chips.set_options([("No numbers", "none"), ("#001", "hash"), (f"1/{total}", "of")],
+                                   self.num_mode)
 
     def on_numbering(self, val):
         self.num_mode = val
