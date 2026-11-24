@@ -1,15 +1,19 @@
 """
 Video Downloader
-Version: 1.3.3
+Version: 1.3.6
 Author: Mashiroto (with Claude)
 
 Description:
-Small desktop app (pop-up window) that downloads videos or audio from
-YouTube, TikTok, Instagram and 1000+ other sites using yt-dlp.
-Everything runs locally on your PC.
+Simple video downloader for YouTube, TikTok, Instagram and 1000+ other sites using yt-dlp. 
+Support Bulk download from YT Playlists. Runs locally on your PC. 
+
 
 Setup (once):
     py -m pip install yt-dlp pillow imageio-ffmpeg
+
+    -Optional- (only if you want/need the feature):
+    py -m pip install tkinterdnd2       - (drag and drop hyperlinks)
+    py -m pip install imageio-ffmpeg    - (partial armount download)
 
 Start:
     py video_downloader.py
@@ -19,7 +23,14 @@ Zoom: Ctrl + mouse wheel, or Ctrl + Plus / Minus, Ctrl + 0 to reset.
 Tip: sites change often. If a download suddenly stops working, update with:
     py -m pip install -U yt-dlp
 
+    
+
 Changelog:
+- 1.3.6: Drag links onto the 'Video link' card (optional, needs tkinterdnd2),
+         'Reset order' button, click a moved number to put it back.
+- 1.3.5: Cancel for single downloads (also while trimming), temp files deleted on close,
+         'Open folder' button under history removed, confirmation before 'Clear history'.
+- 1.3.4: Playlist drag: floating card + 'drop here' slot, original number in ( ); 'optional*' hint in the filename box.
 - 1.3.3: Cards centered correctly, numbering button shows the real count (1/89).
 - 1.3.2: Darker blue, starts maximized + centered, simple scroll bar, copy button in history,
          seconds on hover, trimming works with the bundled ffmpeg.
@@ -63,6 +74,12 @@ except ImportError:
         "py -m pip install yt-dlp pillow imageio-ffmpeg",
     )
     sys.exit(1)
+
+try:   # optional: lets you drag links into the window (the app also works without it)
+    from tkinterdnd2 import TkinterDnD, DND_TEXT
+    HAS_DND = True
+except ImportError:
+    HAS_DND = False
 
 APP_TITLE = "Video Downloader"
 TEMP_DIR = Path(tempfile.gettempdir()) / "VideoDownloaderTemp"  # for "Copy to clipboard"
@@ -330,6 +347,35 @@ def copy_file_to_clipboard(path):
         return False
 
 
+def kill_child_ffmpeg():
+    """Stops ffmpeg processes started by THIS app (other ffmpeg programs stay untouched)."""
+    pid = os.getpid()
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 f"Get-CimInstance Win32_Process | Where-Object {{ $_.ParentProcessId -eq {pid} "
+                 f"-and $_.Name -eq 'ffmpeg.exe' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}"],
+                capture_output=True, timeout=15, creationflags=0x08000000)
+        else:
+            subprocess.run(["pkill", "-P", str(pid), "ffmpeg"], capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
+def remove_partials(folder, since):
+    """Deletes unfinished download leftovers (.part / .ytdl) created since 'since'."""
+    try:
+        for p in Path(folder).iterdir():
+            if p.is_file() and (".part" in p.name or p.name.endswith(".ytdl")) and p.stat().st_mtime >= since - 5:
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 class QuietLogger:
     """Keeps yt-dlp from printing into the console."""
     def debug(self, msg): pass
@@ -450,6 +496,16 @@ class RoundFrame(tk.Canvas):
         self._win = self.create_window(self.px, 0, window=self.body, anchor="nw")
         self.bind("<Configure>", self._on_resize)
         self.body.bind("<Configure>", self._sync)
+
+    def set_outline(self, color):
+        """Change the border color (used as 'drop here' highlight)."""
+        self.outline = color
+        w, h = self.winfo_width(), self.winfo_height()
+        if w > 4 and h > 4:
+            self._img = rr_image(w, h, self.radius, self.fill, self.outline, self.cget("bg"))
+            self.delete("bg")
+            self.create_image(0, 0, image=self._img, anchor="nw", tags="bg")
+            self.tag_lower("bg")
 
     def _sync(self, e=None):
         h = self.body.winfo_reqheight()
@@ -740,7 +796,7 @@ class Pill(tk.Canvas):
 
 class RoundEntry(tk.Canvas):
     """Rounded text input. The real Entry is in .entry"""
-    def __init__(self, parent, var, width=None):
+    def __init__(self, parent, var, width=None, placeholder=None):
         font = F(11)
         h = font.metrics("linespace") + sc(22)
         kw = {}
@@ -750,10 +806,18 @@ class RoundEntry(tk.Canvas):
         self._pbg = parent.cget("bg")
         self.focused = False
         self._img = None
+        self._ph_win = None
         self.entry = tk.Entry(self, textvariable=var, bg=PANEL2, fg=TEXT, insertbackground=TEXT,
                               relief="flat", bd=0, highlightthickness=0, font=font,
                               selectbackground=ACCENT_SOFT, selectforeground=ACCENT)
         self._win = self.create_window(sc(14), h // 2, window=self.entry, anchor="w")
+        if placeholder:      # grey hint text, visible while the box is empty
+            self._var = var
+            ph = tk.Label(self, text=placeholder, bg=PANEL2, fg="#6b6e76", font=font)
+            self._ph_win = self.create_window(sc(14), h // 2, window=ph, anchor="w")
+            ph.bind("<Button-1>", lambda e: self.entry.focus_set())
+            self._tid = var.trace_add("write", self._ph_update)
+            self._ph_update()
         self.entry.bind("<FocusIn>", lambda e: self._focus(True))
         self.entry.bind("<FocusOut>", lambda e: self._focus(False))
         self.bind("<Configure>", self._on_resize)
@@ -761,7 +825,25 @@ class RoundEntry(tk.Canvas):
 
     def _focus(self, on):
         self.focused = on
+        self._ph_update()
         self._paint()
+
+    def _ph_update(self, *args):
+        if self._ph_win is None:
+            return
+        try:
+            show = self._var.get() == "" and not self.focused
+            self.itemconfigure(self._ph_win, state="normal" if show else "hidden")
+        except Exception:
+            pass
+
+    def destroy(self):
+        try:
+            if self._ph_win is not None:
+                self._var.trace_remove("write", self._tid)
+        except Exception:
+            pass
+        super().destroy()
 
     def _on_resize(self, e):
         self.itemconfigure(self._win, width=max(10, e.width - sc(28)))
@@ -972,6 +1054,7 @@ class App:
         self._pl_gen, self._pl_rendered = 0, False
         self.num_mode = "none"     # playlist numbering: none / hash / of
         self._drag_it = None
+        self._ghost = None         # the floating card while dragging a row
         self.cancel_event = threading.Event()
         self.trim_on = False
         self.t_lo = self.t_hi = 0
@@ -988,6 +1071,7 @@ class App:
         self._debounce = self._zoom_job = self._toast_job = self.toast = None
         self.ffmpeg = find_ffmpeg()
         shutil.rmtree(TEMP_DIR, ignore_errors=True)  # remove temporary files of the last session
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
         if not self.ffmpeg:
             self.status_text, self.status_color = "ffmpeg not found. Run: py -m pip install imageio-ffmpeg", DANGER
 
@@ -1075,6 +1159,7 @@ class App:
     def card(self, num, title):
         rf = RoundFrame(self.page, fill=PANEL, outline=BORDER, radius=22, padx=24, pady=20)
         rf.pack(fill="x", pady=(0, sc(14)))
+        self._last_card = rf
         head = tk.Frame(rf.body, bg=PANEL)
         head.pack(fill="x", pady=(0, sc(14)))
         badge(head, num).pack(side="left")
@@ -1116,6 +1201,7 @@ class App:
 
         # 1) Link
         body = self.card(1, "Video link")
+        link_card = self._last_card
         r = tk.Frame(body, bg=PANEL)
         r.pack(fill="x")
         self.url_entry = RoundEntry(r, self.url_var)
@@ -1127,6 +1213,7 @@ class App:
                                  anchor="w", justify="left")
         self.link_msg.pack(fill="x", pady=(sc(10), 0))
         autowrap(self.link_msg, body)
+        self.setup_link_drop(link_card)   # the whole card is a drop zone for links
 
         # 2) Preview
         body = self.card(2, "Preview")
@@ -1174,6 +1261,8 @@ class App:
         Btn(ptop, "Select none", lambda: self.select_all(False), padx=12, pady=5).pack(side="right")
         Btn(ptop, "Select all", lambda: self.select_all(True), padx=12, pady=5).pack(
             side="right", padx=(0, sc(8)))
+        self.reset_btn = Btn(ptop, "Reset order", self.reset_order, padx=12, pady=5)
+        self._reset_shown = False   # only appears after something was reordered
         lf = RoundFrame(self.pl_panel, fill=PANEL2, outline=BORDER, radius=14, padx=6, pady=6)
         lf.pack(fill="x")
         self.pl_canvas = tk.Canvas(lf.body, bg=PANEL2, highlightthickness=0, bd=0, height=sc(320))
@@ -1213,8 +1302,8 @@ class App:
         RoundEntry(fr, self.folder_var).pack(side="left", fill="x", expand=True)
         nr = self.row(body, "Filename")
         self.name_row = self._last_row
-        RoundEntry(nr, self.name_var).pack(fill="x")
-        self.name_note = tk.Label(body, text="Filename is optional. Leave it empty to use the video title.",
+        RoundEntry(nr, self.name_var, placeholder="optional*").pack(fill="x")
+        self.name_note = tk.Label(body, text="* Filename is optional. Leave it empty to use the video title.",
                                   bg=PANEL, fg=MUTED, font=F(9), anchor="w")
         self.name_note.pack(fill="x", pady=(sc(4), 0))
 
@@ -1256,7 +1345,7 @@ class App:
         self.go_btn = Btn(body, self.go_text(), self.start_download, primary=True,
                           font=F(12, "bold"), pady=12, radius=14)
         self.go_btn.pack(fill="x")
-        self.go_btn.set_disabled(self.busy and not self.is_playlist)
+        self.go_btn.set_disabled(False)
         self.progress = ProgressBar(body)
         self.progress.pack(fill="x", pady=(sc(14), 0))
         self.status = tk.Label(body, text=self.status_text, bg=PANEL, fg=self.status_color,
@@ -1270,8 +1359,7 @@ class App:
         self.hist_holder.pack(fill="x")
         br = tk.Frame(body, bg=PANEL)
         br.pack(fill="x", pady=(sc(6), 0))
-        Btn(br, "Open folder", lambda: open_path(self.folder_var.get()), padx=14, pady=6).pack(side="left")
-        Btn(br, "Clear history", self.clear_history, padx=14, pady=6).pack(side="left", padx=(sc(8), 0))
+        Btn(br, "Clear history", self.clear_history, padx=14, pady=6).pack(side="left")
         tk.Label(body, text="Use the icons on the right of a download: copy the file or open its folder. "
                             "History is cleared when you close the app.",
                  bg=PANEL, fg=MUTED, font=F(8), anchor="w", justify="left").pack(fill="x", pady=(sc(10), 0))
@@ -1337,6 +1425,56 @@ class App:
         except tk.TclError:
             return
         self.url_var.set(text)
+        self.load_info()
+
+    def setup_link_drop(self, card):
+        """Drag a link from the browser onto the 'Video link' card."""
+        if not getattr(self.root, "TkdndVersion", None):
+            return   # tkinterdnd2 is optional: not installed -> no drag & drop, everything else works
+
+        def enter(ev):
+            card.set_outline(ACCENT)
+            return "copy"
+
+        def leave(ev):
+            card.set_outline(BORDER)
+            return "copy"
+
+        def drop(ev):
+            card.set_outline(BORDER)
+            self.on_link_drop(ev.data)
+            return "copy"
+
+        def reg(w):   # register the card AND everything inside it
+            try:
+                try:
+                    w.drop_target_register(DND_TEXT, "UniformResourceLocatorW")
+                except tk.TclError:
+                    w.drop_target_register(DND_TEXT)
+                w.dnd_bind("<<DropEnter>>", enter)
+                w.dnd_bind("<<DropPosition>>", lambda ev: "copy")
+                w.dnd_bind("<<DropLeave>>", leave)
+                w.dnd_bind("<<Drop>>", drop)
+            except Exception:
+                return
+            for c in w.winfo_children():
+                reg(c)
+        reg(card)
+        if self.link_text.endswith("other sites."):   # show the drag hint only when it really works
+            self.set_link_msg(self.link_text + " Paste or drag a link in here.")
+
+    def on_link_drop(self, data):
+        text = (data or "").strip()
+        m = re.search(r"https?://[^\s{}]+", text)
+        if m:
+            url = m.group(0)
+        else:   # shortened link from the address bar, e.g. youtube.com/playlist?list=...
+            m = re.search(r"(?:www\.)?[\w-]+(?:\.[\w-]+)+(?:[/?#][^\s{}]*)?", text)
+            url = "https://" + m.group(0) if m else None
+        if not url:
+            self.set_link_msg("That doesn't look like a link. Drag a link in here.", DANGER)
+            return
+        self.url_var.set(url)
         self.load_info()
 
     def on_url_change(self, *args):
@@ -1421,8 +1559,8 @@ class App:
         self.loaded_url = url
         self.meta = meta
         self.is_playlist = bool(meta.get("is_playlist"))
-        self.pl_items = [dict(e, include=True, var=tk.StringVar(value=e["title"]))
-                         for e in meta.get("entries", [])] if self.is_playlist else []
+        self.pl_items = [dict(e, include=True, var=tk.StringVar(value=e["title"]), orig=k + 1)
+                         for k, e in enumerate(meta.get("entries", []))] if self.is_playlist else []
         self.pl_open = False
         self._pl_rendered = False
         self.thumb_pil = None
@@ -1487,6 +1625,7 @@ class App:
             self.update_playlist_stats()
             return
         self.l_site.config(text=m["site"] or "—")
+        self.update_reset_btn()
         self.l_len.config(text=fmt_time(m["duration"]) if m.get("duration") else "Unknown length")
         q, a = source_quality(m)
         self.v_quality.config(text=q)
@@ -1566,10 +1705,13 @@ class App:
 
     # ----- downloading -----
     def start_download(self):
-        if self.busy:
-            if self.is_playlist:   # the button says "Cancel" while a playlist runs
-                self.cancel_event.set()
+        if self.busy:   # the button says "Cancel" while something runs
+            self.cancel_event.set()
+            if self.is_playlist:
                 self.set_status("Cancelling… finishing the current video first.", MUTED)
+            else:
+                self.set_status("Cancelling…", MUTED)
+                threading.Thread(target=self._stop_single, daemon=True).start()
             return
         url = self.url_var.get().strip()
         if not url or url != self.loaded_url or not self.meta:
@@ -1608,7 +1750,8 @@ class App:
             self.on_progress(0.0, f"Starting playlist ({len(items)} videos)…")
             threading.Thread(target=self.worker_playlist, args=(cfg, items), daemon=True).start()
             return
-        self.go_btn.set_disabled(True)
+        self.cancel_event.clear()
+        self.go_btn.set_text("Cancel")
         self.on_progress(None, "Starting…" if not clip else "Downloading the selected part… this can take a moment.")
         threading.Thread(target=self.worker, args=(url, cfg), daemon=True).start()
 
@@ -1623,6 +1766,8 @@ class App:
         last = [0.0]
 
         def hook(d):
+            if self.cancel_event.is_set():
+                raise yt_dlp.utils.DownloadCancelled("cancelled")
             if d["status"] == "downloading":
                 now = time.time()
                 if now - last[0] < 0.2:
@@ -1639,6 +1784,7 @@ class App:
             elif d["status"] == "finished":
                 self.q.put(("progress", None, "Converting… almost done."))
 
+        started = time.time()
         base = cfg["name"] or "%(title).150B"
         tag = f" (clip {tag_time(clip[0])}-{tag_time(clip[1])})" if clip else ""
         opts = {
@@ -1677,6 +1823,11 @@ class App:
                 entry["copied"] = copy_file_to_clipboard(path)
             self.q.put(("done", entry))
         except Exception as e:
+            if self.cancel_event.is_set():   # we stopped it ourselves
+                time.sleep(1)
+                remove_partials(cfg["folder"], started)
+                self.q.put(("cancelled",))
+                return
             entry["ok"] = False
             entry["err"] = clean_error(e)
             self.q.put(("failed", entry, entry["err"]))
@@ -1791,6 +1942,24 @@ class App:
         self.history.append(entry)
         self.render_history()
 
+    def _stop_single(self):
+        for _ in range(60):          # keep trying until the worker has really stopped
+            if not self.busy:
+                break
+            kill_child_ffmpeg()
+            time.sleep(1)
+
+    def on_cancelled(self):
+        self.finish_progress(0.0)
+        self.set_status("Cancelled.", MUTED)
+
+    def on_close(self):
+        if self.busy:
+            self.cancel_event.set()
+            kill_child_ffmpeg()
+        shutil.rmtree(TEMP_DIR, ignore_errors=True)   # temporary "copy" files go away
+        self.root.destroy()
+
     def on_failed(self, entry, msg):
         self.finish_progress(0.0)
         self.set_status("✗ " + msg, DANGER)
@@ -1861,7 +2030,89 @@ class App:
             self.pl_panel.pack_forget()
         self.update_playlist_stats()
 
+    def update_reset_btn(self):
+        """Show 'Reset order' only while the order differs from the original."""
+        btn = getattr(self, "reset_btn", None)
+        if btn is None:
+            return
+        changed = any(it.get("orig", k + 1) != k + 1 for k, it in enumerate(self.pl_items))
+        try:
+            if changed and not self._reset_shown:
+                btn.pack(side="right", padx=(0, sc(8)))   # packed last = left of 'Select all'
+                self._reset_shown = True
+            elif not changed and self._reset_shown:
+                btn.pack_forget()
+                self._reset_shown = False
+        except tk.TclError:
+            pass
+
+    def reset_order(self):
+        self._tip_hide()
+        self.pl_items.sort(key=lambda it: it.get("orig", 0))
+        rows = [it.get("row") for it in self.pl_items]
+        for r in rows:
+            if r is not None:
+                r.pack_forget()
+        for r in rows:
+            if r is not None:
+                r.pack(fill="x", pady=(0, sc(2)))
+        self._renumber(0, len(self.pl_items) - 1)
+
+    def _tip_show(self, text, x, y):
+        self._tip_hide()
+        t = tk.Toplevel(self.root)
+        t.wm_overrideredirect(True)
+        t.configure(bg=ACCENT)
+        tk.Label(t, text=text, bg=PANEL3, fg=TEXT, font=F(9), padx=sc(8), pady=sc(4)).pack(padx=1, pady=1)
+        t.geometry(f"+{x}+{y}")
+        try:
+            t.attributes("-topmost", True)
+        except Exception:
+            pass
+        self._tip = t
+
+    def _tip_hide(self):
+        t = getattr(self, "_tip", None)
+        self._tip = None
+        if t is not None:
+            try:
+                t.destroy()
+            except Exception:
+                pass
+
+    def _num_hover(self, it, e):
+        if self._drag_it is not None or it not in self.pl_items:
+            return
+        pos = self.pl_items.index(it) + 1
+        orig = it.get("orig", pos)
+        if pos != orig:
+            self._tip_show(f"(original order) · click to put back at {orig}", e.x_root + 12, e.y_root + 18)
+
+    def _restore_pos(self, it):
+        """Click on a moved number: the video jumps back to its original spot."""
+        self._tip_hide()
+        if self._drag_it is not None or it not in self.pl_items:
+            return
+        cur = self.pl_items.index(it)
+        tgt = max(0, min(len(self.pl_items) - 1, it.get("orig", cur + 1) - 1))
+        if cur == tgt:
+            return
+        self.pl_items.insert(tgt, self.pl_items.pop(cur))
+        row = it.get("row")
+        if row is not None:
+            try:
+                row.pack_forget()
+                nxt = self.pl_items[tgt + 1] if tgt + 1 < len(self.pl_items) else None
+                if nxt is not None and nxt.get("row") is not None:
+                    row.pack(fill="x", pady=(0, sc(2)), before=nxt["row"])
+                else:
+                    row.pack(fill="x", pady=(0, sc(2)))
+            except tk.TclError:
+                pass
+        self._renumber(min(cur, tgt), max(cur, tgt))
+
     def update_playlist_stats(self):
+        self.update_reset_btn()
         if not self.is_playlist:
             return
         sel = [it for it in self.pl_items if it["include"]]
@@ -1891,45 +2142,104 @@ class App:
         except tk.TclError:
             pass
 
+    def _num_text(self, it, pos):
+        """Position in the list. If the video was moved, its original number follows in ( )."""
+        orig = it.get("orig", pos)
+        return f"{pos} ({orig})" if pos != orig else str(pos)
+
     def _pl_row(self, i):
         it = self.pl_items[i]
         row = tk.Frame(self.pl_inner, bg=PANEL2)
         row.pack(fill="x", pady=(0, sc(2)))
         it["row"] = row
+        ct = tk.Frame(row, bg=PANEL2)   # the content; while dragging a 'drop here' cover is laid over it
+        ct.pack(fill="x")
         # drag handle (three lines): press and drag up/down to change the order
-        hd = tk.Canvas(row, width=sc(20), height=sc(22), bg=PANEL2, highlightthickness=0, bd=0,
+        hd = tk.Canvas(ct, width=sc(20), height=sc(22), bg=PANEL2, highlightthickness=0, bd=0,
                        cursor="fleur")
         for k in range(3):
             y = sc(6) + k * sc(5)
             hd.create_line(sc(3), y, sc(17), y, width=sc(2), fill=MUTED, capstyle="round", tags="ln")
         hd.pack(side="left", padx=(sc(8), 0), pady=sc(5))
-        hd.bind("<ButtonPress-1>", lambda e, it=it, hd=hd: self._drag_start(it, hd))
+        hd.bind("<ButtonPress-1>", lambda e, it=it, hd=hd: self._drag_start(it, hd, e))
         hd.bind("<B1-Motion>", self._drag_move)
         hd.bind("<ButtonRelease-1>", lambda e, hd=hd: self._drag_end(hd))
-        chk = Check(row, it["include"], lambda v, it=it: self.on_item_check(it, v))
+        chk = Check(ct, it["include"], lambda v, it=it: self.on_item_check(it, v))
         chk.pack(side="left", padx=(sc(8), sc(8)), pady=sc(5))
         it["chk"] = chk
-        num = tk.Label(row, text=str(i + 1), width=4, anchor="e", bg=PANEL2, fg=MUTED, font=F(9))
+        moved = (i + 1) != it.get("orig", i + 1)
+        num = tk.Label(ct, text=self._num_text(it, i + 1), width=9, anchor="e", bg=PANEL2,
+                       fg=ACCENT if moved else MUTED, font=F(9))
         num.pack(side="left")
+        num.bind("<Enter>", lambda e, it=it: self._num_hover(it, e))
+        num.bind("<Leave>", lambda e: self._tip_hide())
+        num.bind("<Button-1>", lambda e, it=it: self._restore_pos(it))
+        if moved:
+            num.config(cursor="hand2")
         it["num"] = num
         dur = it.get("duration")
-        tk.Label(row, text=fmt_time(dur) if dur else "", width=7, anchor="e", bg=PANEL2, fg=MUTED,
+        tk.Label(ct, text=fmt_time(dur) if dur else "", width=7, anchor="e", bg=PANEL2, fg=MUTED,
                  font=F(9)).pack(side="right", padx=(0, sc(10)))
-        ent = tk.Entry(row, textvariable=it["var"], bg=PANEL3, fg=TEXT, insertbackground=TEXT,
+        ent = tk.Entry(ct, textvariable=it["var"], bg=PANEL3, fg=TEXT, insertbackground=TEXT,
                        relief="flat", bd=0, highlightthickness=1, highlightbackground=PANEL3,
                        highlightcolor=ACCENT, font=F(10), selectbackground=ACCENT_SOFT,
                        selectforeground=ACCENT)
         ent.pack(side="left", fill="x", expand=True, padx=(sc(8), sc(8)), ipady=sc(4), pady=sc(3))
 
-    def _drag_start(self, it, handle):
+    def _drag_start(self, it, handle, e):
         self._drag_it = it
         handle.itemconfigure("ln", fill=ACCENT)
+        row = it.get("row")
+        # 1) the row turns into an empty "drop here" slot - this is where the video will land
+        cover = tk.Frame(row, bg=ACCENT_SOFT, highlightthickness=1, highlightbackground=ACCENT,
+                         highlightcolor=ACCENT)
+        tk.Label(cover, text="Drop here", bg=ACCENT_SOFT, fg=ACCENT, font=F(9)).place(
+            relx=0.5, rely=0.5, anchor="center")
+        cover.place(x=0, y=0, relwidth=1, relheight=1)
+        it["cover"] = cover
+        # 2) a card with the video floats under the mouse
+        self._make_ghost(it, row)
+        self._ghost_follow(e.y_root)
+
+    def _make_ghost(self, it, row):
+        cw = max(sc(160), self.pl_canvas.winfo_width() - sc(24))
+        ch = max(sc(30), row.winfo_height())
+        g = tk.Canvas(self.pl_canvas, width=cw + sc(8), height=ch + sc(8), bg=PANEL2,
+                      highlightthickness=0, bd=0)
+        shadow = rr_image(cw, ch, sc(12), "#06070a", None, PANEL2)
+        card = rr_image(cw, ch, sc(12), PANEL3, ACCENT, PANEL2, border=2)
+        g._imgs = [shadow, card]
+        g.create_image(sc(4), sc(8), image=shadow, anchor="nw")      # soft shadow under the card
+        g.create_image(0, 0, image=card, anchor="nw")
+        mid = ch // 2
+        for k in range(3):
+            y = mid - sc(5) + k * sc(5)
+            g.create_line(sc(12), y, sc(26), y, width=sc(2), fill=ACCENT, capstyle="round")
+        pos = self.pl_items.index(it) + 1
+        self._ghost_num = g.create_text(sc(36), mid, text=self._num_text(it, pos), anchor="w",
+                                        fill=ACCENT, font=F(9, "bold"))
+        title = it["var"].get().strip() or it["title"]
+        g.create_text(sc(112), mid, text=truncate(title, 60), anchor="w", fill=TEXT, font=F(10, "bold"))
+        dur = it.get("duration")
+        if dur:
+            g.create_text(cw - sc(14), mid, text=fmt_time(dur), anchor="e", fill=MUTED, font=F(9))
+        self._ghost, self._ghost_h = g, ch + sc(8)
+
+    def _ghost_follow(self, y_root):
+        g = self._ghost
+        if g is None:
+            return
+        top, height = self.pl_canvas.winfo_rooty(), self.pl_canvas.winfo_height()
+        y = y_root - top - self._ghost_h // 2
+        g.place(x=sc(4), y=max(0, min(max(0, height - self._ghost_h), y)))
+        tk.Misc.tkraise(g)      # (Canvas.lift would mean something else)
 
     def _drag_move(self, e):
         it = self._drag_it
         if it is None or it.get("row") is None:
             return
         y = e.y_root
+        self._ghost_follow(y)
         try:   # scroll the list when the mouse is near its top / bottom edge
             top = self.pl_canvas.winfo_rooty()
             bottom = top + self.pl_canvas.winfo_height()
@@ -1955,7 +2265,7 @@ class App:
             return
         cur, j = self.pl_items.index(it), self.pl_items.index(target)
         row = it["row"]
-        try:                     # move only this one row in the window ...
+        try:                     # move only this one row (the slot) in the window ...
             row.pack_forget()
             if j < cur:
                 row.pack(fill="x", pady=(0, sc(2)), before=target["row"])
@@ -1969,22 +2279,39 @@ class App:
             return
         self.pl_items.insert(j, self.pl_items.pop(cur))   # ... and in the list
         self._renumber(min(cur, j), max(cur, j))
+        if self._ghost is not None:
+            self._ghost.itemconfigure(self._ghost_num, text=self._num_text(it, j + 1))
         self.pl_inner.update_idletasks()
 
     def _drag_end(self, handle):
-        self._drag_it = None
+        it, self._drag_it = self._drag_it, None
         try:
             handle.itemconfigure("ln", fill=MUTED)
         except Exception:
             pass
+        if self._ghost is not None:
+            try:
+                self._ghost.destroy()
+            except Exception:
+                pass
+            self._ghost = None
+        if it is not None:
+            cover = it.pop("cover", None)
+            try:
+                cover.destroy()
+            except Exception:
+                pass
 
     def _renumber(self, a, b):
         for k in range(a, b + 1):
-            lb = self.pl_items[k].get("num")
+            it = self.pl_items[k]
             try:
-                lb.config(text=str(k + 1))
+                moved = (k + 1) != it.get("orig", k + 1)
+                it["num"].config(text=self._num_text(it, k + 1), fg=ACCENT if moved else MUTED,
+                                 cursor="hand2" if moved else "")
             except Exception:
                 pass
+        self.update_reset_btn()
 
     def on_item_check(self, it, v):
         it["include"] = v
@@ -2001,7 +2328,7 @@ class App:
 
     # ----- clipboard mode -----
     def go_text(self):
-        if self.busy and self.is_playlist:
+        if self.busy:
             return "Cancel"
         if self.is_playlist:
             return "Convert & Download playlist"
@@ -2071,6 +2398,12 @@ class App:
                     row=0, column=2, rowspan=2, sticky="e", padx=(sc(12), 0))
 
     def clear_history(self):
+        if not self.history:
+            return
+        if not messagebox.askyesno("Clear history", "Delete the whole history?\n\n"
+                                   "(Your downloaded files stay where they are.)",
+                                   icon="warning", parent=self.root):
+            return
         self.history.clear()
         self.render_history()
 
@@ -2095,7 +2428,14 @@ def main():
             ctypes.windll.shcore.SetProcessDpiAwareness(1)  # sharper text on Windows
         except Exception:
             pass
-    root = tk.Tk()
+    root = None
+    if HAS_DND:
+        try:
+            root = TkinterDnD.Tk()     # same as tk.Tk(), plus drag & drop
+        except Exception:
+            root = None
+    if root is None:
+        root = tk.Tk()
     App(root)
     root.mainloop()
 
